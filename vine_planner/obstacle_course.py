@@ -12,6 +12,7 @@ from shapely import Polygon
 from .utils import (
     clip_segment,
     legend_label,
+    resolve_pressure_units,
     obstacle_capacity,
     suggested_radius,
     ObstacleCapacityWarning,
@@ -1109,6 +1110,7 @@ class ObstacleCourse(VisibilityMixin):
         legend_info=("length", "angle", "pressure"),
         course_units: str = "ft",
         length_units: str | None = None,
+        pressure_units: str = "psi",
         angle_units: str = "degrees",
         model_parameters: dict | None = None,
     ) -> tuple[plt.Figure, plt.Axes]:
@@ -1122,7 +1124,12 @@ class ObstacleCourse(VisibilityMixin):
         to ``course_units``. Setting it rescales the reported path lengths and
         the axis tick labels and nothing else: an 18 in course shown in feet
         reads 1.5 ft, and every pressure is unchanged because the course did
-        not change size. Pressure is always psi.
+        not change size.
+
+        ``pressure_units`` is the same kind of setting for the reported
+        pressure: ``"psi"``, ``"Pa"``, ``"kPa"``, ``"MPa"`` or ``"bar"``. The
+        model is psi throughout, so this only changes how the result is
+        written down.
 
         Angles are displayed in degrees by default; pass
         ``angle_units="radians"`` to report them in radians.
@@ -1139,6 +1146,8 @@ class ObstacleCourse(VisibilityMixin):
             if length_units is None
             else str(length_units).lower()
         )
+
+        pressure_label, pressure_scale = resolve_pressure_units(pressure_units)
 
         # Coordinate units -> display units. The geometry is left in
         # coordinate units and only the numbers are scaled, so nothing that
@@ -1225,8 +1234,9 @@ class ObstacleCourse(VisibilityMixin):
                     legend_info,
                     length=path_length * display_scale,
                     angle=path_angle_radians * angle_scale,
-                    pressure=pressure,
+                    pressure=pressure * pressure_scale,
                     length_units=normalized_length_units,
+                    pressure_units=pressure_label,
                     angle_units=angle_label,
                 ),
                 zorder=zorder,
@@ -2297,6 +2307,7 @@ class ObstacleCourseVoxels(VisibilityMixin):
         show: bool = True,
         course_units: str = "ft",
         length_units: str | None = None,
+        pressure_units: str = "psi",
         angle_units: str = "degrees",
         model_parameters: dict | None = None,
     ):
@@ -2310,10 +2321,12 @@ class ObstacleCourseVoxels(VisibilityMixin):
         Legend entries are bare names only. Length, cumulative turning and
         pressure all belong to :meth:`PathPlanner.plot_pressure`; crowding them
         into this legend made it unreadable. ``course_units``,
-        ``length_units``, ``angle_units`` and ``model_parameters`` are
-        accepted for signature parity with the polygonal course --
+        ``length_units``, ``pressure_units``, ``angle_units`` and
+        ``model_parameters`` are accepted for signature parity with the
+        polygonal course --
         ``PathPlanner.plot`` forwards them to whichever course it holds -- and
-        are unused here because nothing in this view reports a length.
+        are unused here because nothing in this view reports a length
+        or a pressure.
         """
         import pyvista as pv
 

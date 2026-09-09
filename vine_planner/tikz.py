@@ -46,6 +46,7 @@ from .utils import (
     path_pressure,
     pressure_profile,
     legend_label,
+    resolve_pressure_units,
     normalize_legend_fields,
 )
 
@@ -346,6 +347,7 @@ def course_tikz(
     ylabel: str = None,
     course_units: str = "ft",
     length_units: str = None,
+    pressure_units: str = "psi",
     angle_units: str = "degrees",
     model_parameters: dict = None,
     width: str = r"\linewidth",
@@ -361,6 +363,10 @@ def course_tikz(
     is and is what the pressure model is evaluated in, while ``length_units``
     only changes the numbers printed on the ticks and in the legend. The
     geometry is always emitted in coordinate units.
+
+    ``pressure_units`` is the matching setting for the pressures quoted in
+    the legend: ``"psi"``, ``"Pa"``, ``"kPa"``, ``"MPa"`` or ``"bar"``. Like
+    ``length_units`` it is display only, since the model is psi throughout.
 
     ``show_legend`` defaults to ``False`` here, unlike the Matplotlib method.
     A journal figure carries its description in the caption, and the entries
@@ -389,6 +395,7 @@ def course_tikz(
         normalized_course_units if length_units is None else str(length_units).lower()
     )
     display_scale = _length_conversion(normalized_course_units, normalized_length_units)
+    pressure_label, pressure_scale = resolve_pressure_units(pressure_units)
     angle_scale, angle_label = _resolve_angle_units(angle_units)
 
     # ---- axis options ------------------------------------------------ #
@@ -548,9 +555,10 @@ def course_tikz(
                 fields,
                 length=path_length * display_scale,
                 angle=path_angle * angle_scale,
-                pressure=pressure,
+                pressure=pressure * pressure_scale,
                 length_units=normalized_length_units,
                 angle_units=angle_label,
+                pressure_units=pressure_label,
             )
             content.append(f"    \\addlegendentry{{{_escape(entry)}}}")
 
@@ -586,6 +594,7 @@ def pressure_tikz(
     xlabel: str = None,
     ylabel: str = None,
     length_units: str = None,
+    pressure_units: str = "psi",
     angle_units: str = "degrees",
     points_per_segment: int = 1,
     width: str = r"\linewidth",
@@ -607,7 +616,15 @@ def pressure_tikz(
 
     ``burst_pressure`` adds a horizontal reference line, which is usually the
     point of showing this plot in the paper: the minimum-distance profile
-    crossing it is the failure claim.
+    crossing it is the failure claim. It is read in ``pressure_units``, not
+    in psi -- it is a number you read off the axis, so it has to be in the
+    units the axis is drawn in, and a tube quoted at 180 kPa would otherwise
+    have to be hand-converted to sit on a kPa plot.
+
+    ``pressure_units`` selects the y axis: ``"psi"``, ``"Pa"``, ``"kPa"``,
+    ``"MPa"`` or ``"bar"``. The model is psi throughout, so this rescales the
+    curves, the legend and the burst line together; it cannot change which
+    path the search chose.
     """
     available = (planner.distance_path, planner.angle_path, planner.pressure_path)
 
@@ -621,6 +638,7 @@ def pressure_tikz(
     fields = normalize_legend_fields(legend_info)
 
     normalized_length_units, display_scale = planner._resolve_display_units(length_units)
+    pressure_label, pressure_scale = resolve_pressure_units(pressure_units)
     angle_scale, angle_label = _resolve_angle_units(angle_units)
 
     options = [
@@ -628,7 +646,7 @@ def pressure_tikz(
         f"width={width}",
         f"height={_scale_dimension(width, aspect)}",
         f"xlabel={{{xlabel if xlabel is not None else f'Path length~({normalized_length_units})'}}}",
-        f"ylabel={{{ylabel if ylabel is not None else 'Pressure~(psi)'}}}",
+        f"ylabel={{{ylabel if ylabel is not None else f'Pressure~({pressure_label})'}}}",
         "xmin=0",
     ]
 
@@ -666,6 +684,7 @@ def pressure_tikz(
             **planner.model_parameters,
         )
         lengths = lengths * display_scale
+        pressures = pressures * pressure_scale
         maximum_length = max(maximum_length, float(lengths[-1]))
 
         content.append(f"    % {name}")
@@ -684,6 +703,7 @@ def pressure_tikz(
                 pressure=float(pressures[-1]),
                 length_units=normalized_length_units,
                 angle_units=angle_label,
+                pressure_units=pressure_label,
                 pressure_name="final pressure",
             )
             content.append(f"    \\addlegendentry{{{_escape(entry)}}}")

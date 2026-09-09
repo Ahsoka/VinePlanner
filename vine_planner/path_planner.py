@@ -39,6 +39,7 @@ from .utils import (
     path_metrics,
     path_pressure,
     legend_label,
+    resolve_pressure_units,
 )
 
 
@@ -802,6 +803,7 @@ class PathPlanner:
         *,
         length_units: str = None,
         angle_units: str = "degrees",
+        pressure_units: str = "psi",
         points_per_segment: int = 50,
         title: str = None,
         show: bool = True,
@@ -819,7 +821,15 @@ class PathPlanner:
         ``self.length_units``, so plotting an 18 in course in feet reports the
         same pressures against an axis reading 1.5 instead of 18. To state
         that the course is a different physical size, which does change the
-        optimal path, use ``set_length_units`` and re-solve.
+        optimal path, construct a new planner with the intended
+        ``length_units``: it is a model parameter that the drag term is baked
+        into at graph construction, so assigning it afterwards leaves the
+        planner inconsistent rather than restating the problem.
+
+        ``pressure_units`` is the same kind of setting for the y axis:
+        ``"psi"``, ``"Pa"``, ``"kPa"``, ``"MPa"`` or ``"bar"``. The model is
+        psi throughout, so this rescales the plotted curve and its legend
+        together and cannot alter the physics or the path that was chosen.
 
         Cumulative turning is reported in the legend for reference. It does
         not determine the pressure on its own: two paths with equal length and
@@ -842,6 +852,8 @@ class PathPlanner:
         normalized_length_units, display_scale = self._resolve_display_units(
             length_units
         )
+
+        pressure_label, pressure_scale = resolve_pressure_units(pressure_units)
 
         normalized_angle_units = angle_units.lower()
         if normalized_angle_units in {"degree", "degrees", "deg"}:
@@ -886,6 +898,7 @@ class PathPlanner:
                 **self.model_parameters,
             )
             lengths = lengths * display_scale
+            pressures = pressures * pressure_scale
 
             ax.plot(
                 lengths,
@@ -901,12 +914,13 @@ class PathPlanner:
                     pressure=float(pressures[-1]),
                     length_units=normalized_length_units,
                     angle_units=angle_label,
+                    pressure_units=pressure_label,
                     pressure_name="final pressure",
                 ),
             )
 
         ax.set_xlabel(f"Path length ({normalized_length_units})")
-        ax.set_ylabel("Pressure (psi)")
+        ax.set_ylabel(f"Pressure ({pressure_label})")
         ax.set_title(title or "Vine Robot Pressure vs. Path Length")
         ax.grid(alpha=0.25)
 

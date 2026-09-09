@@ -10,7 +10,9 @@ from .constants import (
     LENGTH_FRICTION_PSI_PER_FT,
     TAIL_TENSION_PSI,
     CURVATURE_FRICTION_COEFFICIENT,
-    _LENGTH_TO_FEET
+    _LENGTH_TO_FEET,
+    _PRESSURE_TO_PSI,
+    _PRESSURE_LABELS,
 )
 
 # ------------------------------------------------------------------
@@ -111,6 +113,49 @@ def segment_geometry(path) -> tuple[np.ndarray, np.ndarray]:
     )
 
     return lengths, angles
+
+
+# ------------------------------------------------------------------
+# Pressure units
+# ------------------------------------------------------------------
+#
+# The model is psi throughout: the calibrated parameters are psi and psi
+# per foot, and `vine_robot_pressure` returns psi. Pressure units are
+# therefore a display concern only, exactly as `length_units` is for the
+# axis of a plot -- converting a result cannot change the physics or the
+# path that was chosen.
+#
+# The tables themselves live in `constants`, alongside `_LENGTH_TO_FEET`,
+# since they are fixed definitions rather than behaviour.
+
+
+def pressure_conversion(source_units: str, target_units: str) -> float:
+    """Multiplier taking a pressure in ``source_units`` to ``target_units``."""
+    for units in (source_units, target_units):
+        if str(units).lower() not in _PRESSURE_TO_PSI:
+            raise ValueError(
+                "pressure units must be one of: 'psi', 'Pa', 'kPa', 'MPa', "
+                f"or 'bar'; got {units!r}."
+            )
+
+    return (
+        _PRESSURE_TO_PSI[str(source_units).lower()]
+        / _PRESSURE_TO_PSI[str(target_units).lower()]
+    )
+
+
+def resolve_pressure_units(pressure_units: str = "psi") -> tuple[str, float]:
+    """Display label and the factor converting model psi into those units.
+
+    Returns the properly cased label, so a caller passing ``"kpa"`` still
+    gets ``"kPa"`` on the axis.
+    """
+    if pressure_units is None:
+        return "psi", 1.0
+
+    key = str(pressure_units).lower()
+
+    return _PRESSURE_LABELS[key], pressure_conversion("psi", key)
 
 
 def vine_robot_pressure(
@@ -279,6 +324,29 @@ def normalize_legend_fields(fields=_DEFAULT_LEGEND_FIELDS) -> tuple[str, ...]:
     return tuple(resolved)
 
 
+def _significant(value: float, digits: int = 4) -> str:
+    """Format to a fixed number of significant figures, in positional notation.
+
+    ``%g`` is the obvious choice and is wrong twice over here. It strips
+    trailing zeros, so 36.2042 kPa prints as ``36.2`` and silently drops to
+    three significant figures while 3.857 psi keeps four; and it switches to
+    scientific notation, so the same pressure in pascals becomes
+    ``2.659e+04`` in the middle of a legend entry.
+
+    Choosing the decimal count from the magnitude instead keeps the figure
+    count honest across the six orders of magnitude between pascals and
+    megapascals, and reproduces the old ``.3f`` psi formatting exactly, since
+    a pressure of a few psi has its first significant figure in the units
+    place.
+    """
+    if not np.isfinite(value) or value == 0.0:
+        return f"{value:.{max(digits - 1, 0)}f}"
+
+    exponent = int(np.floor(np.log10(abs(value))))
+
+    return f"{value:.{max(digits - 1 - exponent, 0)}f}"
+
+
 def legend_label(
     name: str,
     fields=_DEFAULT_LEGEND_FIELDS,
@@ -288,21 +356,45 @@ def legend_label(
     pressure: float = None,
     length_units: str = "ft",
     angle_units: str = "deg",
+    pressure_units: str = "psi",
     pressure_name: str = "pressure",
 ) -> str:
-    """``"min pressure (length=48.37 ft, pressure=3.857 psi)"``.
+    """``"min pressure (length=14.75 m, pressure=26.59 kPa)"``.
 
     A field is omitted when it was not selected *or* when its value was not
     supplied, so a caller that has no angle to report does not have to edit
     its field list to match.
+
+    ``pressure`` is expected already in ``pressure_units``; this only labels
+    it. Conversion belongs with the caller that also has to rescale the axis,
+    so that a plotted curve and its legend cannot end up in different units.
+
+    Pressures are shown to four significant figures rather than a fixed
+    number of decimals, because the same result spans six orders of magnitude
+    between pascals and megapascals. Four figures reproduces the previous
+    ``.3f`` psi formatting exactly.
     """
     values = {"length": length, "angle": angle, "pressure": pressure}
-    units = {"length": length_units, "angle": angle_units, "pressure": "psi"}
-    formats = {"length": ".2f", "angle": ".2f", "pressure": ".3f"}
+    units = {
+        "length": length_units,
+        "angle": angle_units,
+        "pressure": pressure_units,
+    }
     labels = {"length": "length", "angle": "angle", "pressure": pressure_name}
 
+    def render(field: str) -> str:
+        value = values[field]
+
+        # Lengths and angles stay on two decimals: both are read off an axis
+        # whose own units the caller already chose, so their magnitude is
+        # bounded. Pressure is the one that has to survive psi through pascals.
+        if field == "pressure":
+            return _significant(value)
+
+        return f"{value:.2f}"
+
     parts = [
-        f"{labels[field]}={values[field]:{formats[field]}} {units[field]}"
+        f"{labels[field]}={render(field)} {units[field]}"
         for field in normalize_legend_fields(fields)
         if values[field] is not None
     ]
