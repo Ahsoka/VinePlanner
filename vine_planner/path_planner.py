@@ -38,6 +38,7 @@ from .utils import (
     pressure_profile,
     path_metrics,
     path_pressure,
+    legend_label,
 )
 
 
@@ -804,6 +805,8 @@ class PathPlanner:
         points_per_segment: int = 50,
         title: str = None,
         show: bool = True,
+        show_legend: bool = True,
+        legend_info=("length", "angle", "pressure"),
     ) -> tuple[plt.Figure, plt.Axes]:
         """Plot required vine-robot pressure versus deployed path length.
 
@@ -890,11 +893,15 @@ class PathPlanner:
                 linewidth=2.5,
                 color=color,
                 linestyle=linestyle,
-                label=(
-                    f"{name} "
-                    f"(length={lengths[-1]:.2f} {normalized_length_units}, "
-                    f"angle={angle_radians * angle_scale:.2f} {angle_label}, "
-                    f"final pressure={pressures[-1]:.3f} psi)"
+                label=legend_label(
+                    name,
+                    legend_info,
+                    length=float(lengths[-1]),
+                    angle=angle_radians * angle_scale,
+                    pressure=float(pressures[-1]),
+                    length_units=normalized_length_units,
+                    angle_units=angle_label,
+                    pressure_name="final pressure",
                 ),
             )
 
@@ -907,13 +914,44 @@ class PathPlanner:
         # default legend zorder, but the profiles are the obvious thing to
         # start layering, and a legend that sometimes hides is worse than one
         # that never does.
-        legend = ax.legend(framealpha=1.0)
-        legend.set_zorder(_LEGEND_ZORDER)
+        if show_legend:
+            legend = ax.legend(framealpha=1.0)
+            legend.set_zorder(_LEGEND_ZORDER)
 
         if show:
             plt.show()
 
         return fig, ax
+
+    def to_tikz(self, *args, **kwargs) -> str:
+        """PGFPlots/TikZ source for the course plot.
+
+        The counterpart of ``plot``: the goals, the computed paths, the course
+        units and the model parameters are supplied from the planner, so the
+        pressures quoted in the figure are the ones the search optimised.
+        """
+        from .tikz import course_tikz
+
+        kwargs["course_units"] = self.length_units
+        kwargs.setdefault("model_parameters", self.model_parameters)
+
+        return course_tikz(
+            self.obstacle_course,
+            self.start,
+            self.end,
+            self.distance_path,
+            self.angle_path,
+            self.pressure_path,
+            *args,
+            **kwargs,
+        )
+
+    def pressure_to_tikz(self, *args, **kwargs) -> str:
+        """PGFPlots/TikZ source for the pressure profile; see
+        ``tikz.pressure_tikz``."""
+        from .tikz import pressure_tikz
+
+        return pressure_tikz(self, *args, **kwargs)
 
     @overload
     def plot(
