@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import warnings
 import numpy as np
 import itertools
 import shapely
@@ -10,13 +11,19 @@ from attrs import define, field, validators
 from shapely import Polygon
 from .utils import (
     clip_segment,
+    legend_label,
+    obstacle_capacity,
+    suggested_radius,
+    ObstacleCapacityWarning,
     path_metrics,
     path_pressure,
-    grow_barrier,
     bridge_segment,
-    corner_interval,
     annulus_obstacle,
+    staggered_centers,
+    sample_uniform_points,
     intersect_intervals,
+    diameter_fit_count,
+    place_random_obstacles,
     free_parameter_intervals
 )
 
@@ -31,6 +38,20 @@ _LEGEND_ZORDER = 100
 # never satisfy the disjointness requirement into an error instead of a hang.
 _INITIAL_PATH_BUDGET = 16
 _MAXIMUM_PATH_BUDGET = 4096
+
+# Range the obstacle count is drawn from when ``ObstacleCourse.random`` is not
+# given one. The low end sits above what the structured layout needs on a
+# square course at the default radius, so an unspecified count still gets the
+# structured layout rather than the free-placement fallback.
+_DEFAULT_MINIMUM_OBSTACLES = 30
+_DEFAULT_MAXIMUM_OBSTACLES = 40
+
+# Corner of the course each randomly drawn goal is confined to, as a fraction
+# of the dimensions: the start comes from the bottom-left box of this size and
+# the goal from the mirrored top-right one. A quarter keeps the two boxes well
+# clear of one another, so the pair is always separated by at least half the
+# course in both axes.
+_GOAL_BOX_FRACTION = 0.25
 
 
 def _length_conversion(source_units: str, target_units: str) -> float:
@@ -250,80 +271,91 @@ class ObstacleCourse(VisibilityMixin):
         height: float = 25,
         num_obstacles: int = None,
         seed: int = None,
-        min_obstacles: int = 15,
-        max_obstacles: int = 20,
         radius: float = None,
         annulus_fraction: float = 0.005,
-        wall_fraction: float = 0.1,
-        corner_obstacles: int = 1,
-        corner_span_fraction: float = 0.15,
+        corner_offset_fraction: float = 0.8,
         min_vertices: int = 3,
         max_vertices: int = 6,
+        raise_if_insufficient: bool = False,
+        random_start: bool = False,
     ):
-        """Generate a random course anchored on two opposite corner barriers.
+        """Generate a random course of uniformly sized obstacles.
 
-        Two barriers are built, one across the bottom-left quadrant and a
-        mirrored one across the top-right quadrant. Splitting a quadrant in
-        four again, its barrier is forced to reach into two opposite
-        sub-quadrants, and in each of those the point is pushed hard
-        against the outer wall: within ``wall_fraction`` of the course
-        dimension. So the bottom-left barrier runs from the left wall to
-        the floor, sealing off the origin, and the top-right barrier
-        mirrors it.
+        Every obstacle is the same size as every other, so the layout does
+        not advertise which route it was built to reward. The structure
+        comes from where two of them sit rather than from how big they are:
+        one obstacle is placed on the line from ``(0, 0)`` to
+        ``(width, height)`` exactly one maximum radius from each end. Two
+        of its vertices are forced onto the line through that center
+        perpendicular to the start-goal line, one on each side, each at
+        its own radius from the annulus, so the obstacle reaches its full
+        width across the route rather than whatever width the angles
+        happened to give it. An ordinary obstacle placed and shaped that
+        way closes off the straight run between the goals as effectively
+        as a large barrier further out.
 
-        Every further barrier vertex is drawn from the quadrant with the
-        current hull cut out of it, which puts the new point outside the
-        hull by construction and so makes it a vertex of the grown hull.
+        A temporary course holding only those two is then solved from
+        ``(0, 0)`` to ``(width, height)``. The shortest path is retained,
+        then the shortest path whose direct obstacle-to-obstacle segment
+        shares neither endpoint with the first. Each of those two segments
+        is shifted up and down by ``radius``, and the obstacles that fit at
+        one diameter apart are spaced evenly along it and projected onto
+        the two shifted copies alternately, so neighbours are staggered.
+        One further obstacle then straddles ``(0, height)`` and one
+        straddles ``(width, 0)``. Each sits just inside its corner on the
+        corner bisector with a vertex forced outwards along it, which puts
+        the corner point inside the obstacle and that vertex outside the
+        course. Covering the corner removes the right-angle route around the
+        outside of the course; the part lying outside is dropped from
+        ``vertices()``, so it never becomes a turning point.
 
-        The remaining obstacles have vertices sampled the standard way, at
-        a random angle and a random radius from a thin annulus. Their
-        centers come from three places: near ``(0, height)``, near
-        ``(width, 0)``, and along four lines derived from paths through the
-        two corner barriers. A temporary two-obstacle course is solved from
-        ``(0, 0)`` to ``(width, height)`` with ``PathPlanner``. The shortest
-        path is retained first. The next retained path is the shortest path
-        whose direct A-to-B segment shares neither its obstacle-A endpoint
-        nor its obstacle-B endpoint with the first path's segment. Each
-        direct segment
-        is translated vertically by ``-radius / 2`` and ``+radius / 2``,
-        producing four placement lines. The remaining obstacle count is
-        divided between the two original direct segments in proportion to
-        their usable segment lengths. For each original direct segment, the
-        combined centers assigned to its two translated lines are then spaced
-        evenly along the original segment. Those centerline points
-        are then alternately projected vertically onto the lower and upper
-        translated lines. This staggers neighboring obstacles instead of
-        placing opposing obstacles at nearly the same longitudinal position.
-        Together with the two barriers and the two corner clusters, all four
-        corners are always occupied, so the course always holds at least
-        four obstacles.
+        Because the count along each segment follows from the obstacle
+        diameter, the course needs a specific number of obstacles rather
+        than accepting any number. Given more, the surplus is placed with
+        centers drawn uniformly from whatever free space is left. Given
+        fewer, the structured layout is abandoned and every obstacle is
+        placed in free space instead, unless ``raise_if_insufficient`` asks
+        for an error.
 
-        Every standard obstacle is sampled against the current Shapely
-        free-space geometry. Before an obstacle is accepted, the union of all
-        previously generated polygons is subtracted from the complete course
-        region with ``shapely.difference``. All sampled vertices and the full
-        candidate polygon must be covered by that free-space region, so
-        obstacle interiors cannot overlap.
+        Every obstacle is sampled against the current Shapely free-space
+        geometry: the union of all previously generated polygons is
+        subtracted from the course region, and both the sampled vertices
+        and the whole candidate polygon must be covered by what is left, so
+        obstacle interiors never overlap and nothing crosses a wall.
 
         Parameters
         ----------
+        num_obstacles:
+            How many obstacles the course holds, counting the two goal
+            obstacles and the two corner ones. Left as ``None`` the count is
+            drawn uniformly from ``_DEFAULT_MINIMUM_OBSTACLES`` through
+            ``_DEFAULT_MAXIMUM_OBSTACLES``, currently 30 to 40.
         radius:
             Inner sampling radius, ``min_radius``. Defaults to four
-            percent of the smaller course dimension.
+            percent of the smaller course dimension. It sets the spacing
+            along the two segments, so halving it roughly doubles how many
+            obstacles the layout needs.
         annulus_fraction:
             ``max_radius`` is ``radius`` plus this fraction of
             ``min(width, height)``.
-        wall_fraction:
-            How close to the wall the two required barrier points are
-            pushed, as a fraction of the course dimension.
-        corner_obstacles:
-            Obstacles placed at each of ``(0, height)`` and
-            ``(width, 0)``.
-        corner_span_fraction:
-            Size of the box those centers are drawn from, as a fraction of
-            the course dimensions.
+        corner_offset_fraction:
+            How far the two corner obstacles sit inside their corner,
+            measured along the corner bisector as a fraction of
+            ``min_radius``. Raising it puts more of the obstacle inside the
+            course; it must stay below one, which is exactly the condition
+            that keeps the corner point inside the obstacle and the
+            obstacle's outward vertex outside the course.
         min_vertices, max_vertices:
             Bounds on the vertex count, inclusive.
+        raise_if_insufficient:
+            Raise instead of falling back to free placement when
+            ``num_obstacles`` is below what the structured layout needs.
+        random_start:
+            Return ``(course, start, end)`` with a goal drawn at random from
+            each of the two opposite corner boxes, instead of the course
+            alone. Both points are guaranteed valid: neither lies in the
+            interior of an obstacle. Note that this changes the return type,
+            so a caller that passes it has to unpack the result.
         """
 
         rng = np.random.default_rng(seed)
@@ -335,33 +367,22 @@ class ObstacleCourse(VisibilityMixin):
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive.")
 
-        if corner_obstacles < 0:
-            raise ValueError("corner_obstacles must be nonnegative.")
-
-        # Two barriers, plus a cluster at each of the two free corners.
-        reserved_obstacles = 2 + 2 * corner_obstacles
-
         if num_obstacles is None:
-            if min_obstacles < reserved_obstacles:
-                raise ValueError(
-                    f"min_obstacles must be at least {reserved_obstacles}: "
-                    "two barriers plus the corner clusters."
-                )
-
-            if max_obstacles < min_obstacles:
-                raise ValueError(
-                    "max_obstacles must be greater than or equal to "
-                    "min_obstacles."
-                )
-
             num_obstacles = int(
-                rng.integers(min_obstacles, max_obstacles + 1)
+                rng.integers(
+                    _DEFAULT_MINIMUM_OBSTACLES,
+                    _DEFAULT_MAXIMUM_OBSTACLES + 1,
+                )
             )
 
-        if num_obstacles < reserved_obstacles:
+        if num_obstacles < 1:
+            raise ValueError("num_obstacles must be at least one.")
+
+        if not 0.0 <= corner_offset_fraction < 1.0:
             raise ValueError(
-                f"num_obstacles must be at least {reserved_obstacles}: "
-                "two barriers plus the corner clusters."
+                "corner_offset_fraction must lie in [0, 1). At one the "
+                "corner obstacle's outward vertex could fall on the corner "
+                "instead of beyond it, and neither guarantee would hold."
             )
 
         if min_vertices < 3:
@@ -371,17 +392,6 @@ class ObstacleCourse(VisibilityMixin):
             raise ValueError(
                 "max_vertices must be greater than or equal to "
                 "min_vertices."
-            )
-
-        if not 0.0 < wall_fraction < 0.25:
-            raise ValueError(
-                "wall_fraction must lie in (0, 0.25) so the strip stays "
-                "inside its sub-quadrant."
-            )
-
-        if not 0.0 < corner_span_fraction <= 0.5:
-            raise ValueError(
-                "corner_span_fraction must lie in (0, 0.5]."
             )
 
         smaller_dimension = min(width, height)
@@ -394,6 +404,11 @@ class ObstacleCourse(VisibilityMixin):
 
         min_radius = radius
         max_radius = min_radius + annulus_fraction * smaller_dimension
+
+        # Centers along a segment are spaced by one diameter, the
+        # separation at which two obstacles drawn from this annulus cannot
+        # touch whatever the draw does.
+        diameter = 2.0 * max_radius
 
         # Nudges every sampled coordinate strictly inside the course, so
         # that 0 < x < width and 0 < y < height rather than 0 <= x <= width.
@@ -414,484 +429,573 @@ class ObstacleCourse(VisibilityMixin):
                 "inside."
             )
 
-        half_width = 0.5 * width
-        half_height = 0.5 * height
-        wall_x = wall_fraction * width
-        wall_y = wall_fraction * height
-
-        # Bottom-left: reaches the left wall in the top-left sub-quadrant
-        # and the floor in the bottom-right sub-quadrant.
-        origin_barrier = grow_barrier(
-            (0.0, 0.0, half_width, half_height),
-            (0.0, 0.25 * height, wall_x, half_height),
-            (0.25 * width, 0.0, half_width, wall_y),
-            rng, min_vertices, max_vertices, epsilon
+        # A request far above what the course can hold is worth catching
+        # here rather than after a long run that quietly returns fewer
+        # obstacles than were asked for. The estimate is deliberately a
+        # ceiling, so this fires only on a request that cannot be met.
+        capacity = obstacle_capacity(
+            width,
+            height,
+            min_vertices,
+            max_vertices,
+            min_radius,
+            max_radius,
         )
 
-        # Top-right: the same construction rotated half a turn, so it
-        # reaches the right wall and the ceiling.
-        far_barrier = grow_barrier(
-            (half_width, half_height, width, height),
-            (width - wall_x, half_height, width, 0.75 * height),
-            (half_width, height - wall_y, 0.75 * width, height),
-            rng, min_vertices, max_vertices, epsilon
-        )
-
-        polygons = [
-            Polygon(origin_barrier),
-            Polygon(far_barrier),
-        ]
+        if num_obstacles > capacity:
+            recommended = suggested_radius(
+                width,
+                height,
+                num_obstacles,
+                min_vertices,
+                max_vertices,
+                max_radius - min_radius,
+            )
+            warnings.warn(
+                f"{num_obstacles} obstacles were requested but a "
+                f"{width:g} x {height:g} course fits roughly {capacity} at "
+                f"radius={min_radius:g}; expect the generator to fall short. "
+                f"Pass radius={recommended:.3g} or smaller to fit "
+                f"{num_obstacles}.",
+                ObstacleCapacityWarning,
+                stacklevel=2,
+            )
 
         course_region = shapely.box(0.0, 0.0, width, height)
+        center_region = shapely.box(
+            inset_low_x,
+            inset_low_y,
+            inset_high_x,
+            inset_high_y,
+        )
 
-        span_x = corner_span_fraction * width
-        span_y = corner_span_fraction * height
+        polygons = []
 
-        for corner_x, corner_y in ((0.0, height), (width, 0.0)):
-            low_x, high_x = corner_interval(
-                corner_x,
-                inset_low_x,
-                inset_high_x,
-                span_x,
+        def report_shortfall():
+            """Warn when the course holds fewer obstacles than were asked for.
+
+            ``place_random_obstacles`` returns how many it managed and the
+            structured stages can each fall back, so a shortfall is otherwise
+            invisible: the caller gets a valid course that simply is not the
+            one it requested.
+            """
+            if len(polygons) < num_obstacles:
+                warnings.warn(
+                    f"{num_obstacles} obstacles were requested but only "
+                    f"{len(polygons)} could be placed; the course ran out of "
+                    "room. Reduce num_obstacles or radius if the exact count "
+                    "matters.",
+                    ObstacleCapacityWarning,
+                    stacklevel=3,
+                )
+
+        def free_layout():
+            """Place every obstacle in free space and return the course."""
+            del polygons[:]
+            place_random_obstacles(
+                num_obstacles,
+                rng,
+                min_vertices,
+                max_vertices,
+                min_radius,
+                max_radius,
+                polygons,
+                course_region,
+                center_region,
             )
-            low_y, high_y = corner_interval(
-                corner_y,
-                inset_low_y,
-                inset_high_y,
-                span_y,
-            )
+            report_shortfall()
+            return cls(width=width, height=height, obstacles=polygons)
 
-            for _ in range(corner_obstacles):
-                # Keep the same corner box and annulus construction, but retry
-                # the random center when a draw cannot fit inside the current
-                # Shapely free-space set. This matters when more than one
-                # obstacle is requested in a corner cluster.
-                for _center_attempt in range(2000):
-                    center = np.array([
-                        rng.uniform(low_x, high_x),
-                        rng.uniform(low_y, high_y),
-                    ])
-                    obstacle = annulus_obstacle(
-                        center,
-                        rng,
-                        min_vertices,
-                        max_vertices,
-                        min_radius,
-                        max_radius,
-                        polygons,
-                        course_region,
-                        raise_on_failure=False,
+        def random_goals(course):
+            """A valid start and end drawn from opposite corners of the course.
+
+            Sampling uniformly from the corner box with the obstacles
+            subtracted makes a draw valid by construction rather than by
+            retrying until one happens to be. ``valid_goal`` is still applied
+            on top: a point landing exactly on an obstacle boundary is inside
+            the sampled region, and a path may not start from one.
+            """
+            goals = []
+
+            for low_x, low_y, high_x, high_y in (
+                (
+                    0.0,
+                    0.0,
+                    _GOAL_BOX_FRACTION * width,
+                    _GOAL_BOX_FRACTION * height,
+                ),
+                (
+                    (1.0 - _GOAL_BOX_FRACTION) * width,
+                    (1.0 - _GOAL_BOX_FRACTION) * height,
+                    width,
+                    height,
+                ),
+            ):
+                free_corner = shapely.difference(
+                    shapely.box(low_x, low_y, high_x, high_y),
+                    course.obstacles_region,
+                )
+
+                if (
+                    free_corner.is_empty
+                    or free_corner.area <= 0.0
+                    or free_corner.geom_type
+                    not in ("Polygon", "MultiPolygon")
+                ):
+                    raise RuntimeError(
+                        "No free space is left in the corner a random goal "
+                        "is drawn from. Reduce num_obstacles or radius."
                     )
 
-                    if obstacle is not None:
-                        polygons.append(obstacle)
+                # One triangulation covers every attempt, so the retry costs
+                # nothing beyond the validity test itself.
+                for candidate in sample_uniform_points(free_corner, 64, rng):
+                    if course.valid_goal(candidate):
+                        goals.append(np.asarray(candidate, dtype=float))
                         break
                 else:
                     raise RuntimeError(
-                        "Could not place a non-overlapping obstacle in a "
-                        "corner cluster. Reduce corner_obstacles or radius, "
-                        "or increase corner_span_fraction."
+                        "Could not draw a valid goal from a corner of the "
+                        "course."
                     )
 
-        remaining = num_obstacles - reserved_obstacles
+            return goals
 
-        if remaining > 0:
-            from .path_planner import PathPlanner
-            # Solve the simplified problem using only obstacle A (the
-            # bottom-left barrier) and obstacle B (the top-right barrier).
-            simplified_course = cls(
-                width=width,
-                height=height,
-                obstacles=polygons[:2].copy(),
-            )
-            simplified_planner = PathPlanner(
-                obstacle_course=simplified_course,
-                start=np.array([0.0, 0.0]),
-                end=np.array([width, height]),
-            )
+        def finish(course):
+            """Attach randomly drawn goals when they were asked for."""
+            if not random_start:
+                return course
 
-            # The planner keys its graph by integer index into `coords`, so
-            # the search runs on indices and the result is mapped back to
-            # coordinates for bridge_segment, which compares against the
-            # obstacles' own vertex tuples.
-            start_node = simplified_planner.start_index
-            end_node = simplified_planner.end_index
-            planner_coords = simplified_planner.coords
+            return (course, *random_goals(course))
 
-            obstacle_a_vertices = set(
-                simplified_course.obstacles[0].exterior.coords[:-1]
-            )
-            obstacle_b_vertices = set(
-                simplified_course.obstacles[1].exterior.coords[:-1]
-            )
+        # The two goal obstacles plus one on each of the other two corners.
+        reserved_obstacles = 4
 
-            # Paths arrive in nondecreasing total visibility-graph length,
-            # so the first usable one is the shortest path. After fixing its
-            # bridge (a_i, b_j), continue through the same ordered list and
-            # retain the first path whose bridge (a_k, b_l) satisfies both
-            # a_k != a_i and b_l != b_j. The second selected path is therefore
-            # the shortest one obeying the endpoint-disjointness requirement,
-            # rather than merely one using a different A-to-B edge. That
-            # ordering guarantee is the whole reason a k-shortest-paths
-            # routine is needed here instead of a plain shortest path.
-            #
-            # scipy's yen() is not a lazy generator: K is fixed up front and
-            # it returns at most K paths. The budget is therefore doubled
-            # until either two acceptable bridges are found or the graph is
-            # exhausted, which is signalled by fewer than K paths coming back.
-            # Rescanning from scratch after each doubling is wasteful in
-            # principle and free in practice, because this runs once on a
-            # two-obstacle course of roughly a dozen vertices.
-            chosen_bridges = []
-            budget = _INITIAL_PATH_BUDGET
-
-            while True:
-                candidate_paths = simplified_planner.k_shortest_paths(budget)
-
-                if not candidate_paths:
-                    raise RuntimeError(
-                        "The simplified two-obstacle course has no path from "
-                        "(0, 0) to (width, height)."
-                    )
-
-                chosen_bridges = []
-                first_a_vertex = None
-                first_b_vertex = None
-
-                for path_indices in candidate_paths:
-                    path_vertices = [
-                        tuple(planner_coords[index]) for index in path_indices
-                    ]
-                    bridge = bridge_segment(
-                        path_vertices,
-                        obstacle_a_vertices,
-                        obstacle_b_vertices,
-                    )
-
-                    if bridge is None:
-                        continue
-
-                    a_vertex, b_vertex = bridge
-
-                    if not chosen_bridges:
-                        chosen_bridges.append(bridge)
-                        first_a_vertex = a_vertex
-                        first_b_vertex = b_vertex
-                        continue
-
-                    if (
-                        a_vertex == first_a_vertex
-                        or b_vertex == first_b_vertex
-                    ):
-                        continue
-
-                    chosen_bridges.append(bridge)
-                    break
-
-                if len(chosen_bridges) >= 2:
-                    break
-
-                # Fewer paths than asked for means the graph has no more, so
-                # a larger budget cannot help.
-                if len(candidate_paths) < budget:
-                    break
-
-                if budget >= _MAXIMUM_PATH_BUDGET:
-                    raise RuntimeError(
-                        "Could not find a second endpoint-disjoint bridge "
-                        f"within the {_MAXIMUM_PATH_BUDGET} shortest paths of "
-                        "the simplified two-obstacle course."
-                    )
-
-                budget = min(2 * budget, _MAXIMUM_PATH_BUDGET)
-
-            if len(chosen_bridges) < 2:
-                raise RuntimeError(
-                    "Could not find a second path whose A-to-B segment uses "
-                    "a different obstacle-A vertex and a different "
-                    "obstacle-B vertex from the shortest path."
+        if num_obstacles < reserved_obstacles:
+            if raise_if_insufficient:
+                raise ValueError(
+                    f"num_obstacles is {num_obstacles} but the two goal "
+                    f"obstacles and the two corner obstacles alone need "
+                    f"{reserved_obstacles}."
                 )
 
-            # Translating y by +/- radius/2 implements
-            # y = m*x + b +/- radius/2 exactly as requested.
-            vertical_offsets = (
-                np.array([0.0, -1 * radius]),
-                np.array([0.0, 1 * radius]),
-            )
-            placement_pairs = []
+            return finish(free_layout())
 
-            for bridge_start, bridge_end in chosen_bridges:
-                bridge_start = np.asarray(bridge_start, dtype=float)
-                bridge_end = np.asarray(bridge_end, dtype=float)
+        # ------------------------------------------------------------------
+        # One obstacle hard against each goal
+        # ------------------------------------------------------------------
 
-                shifted_segments = []
+        goal_line = np.array([width, height], dtype=float)
+        goal_direction = goal_line / np.linalg.norm(goal_line)
 
-                for vertical_offset in vertical_offsets:
-                    shifted_start = bridge_start + vertical_offset
-                    shifted_end = bridge_end + vertical_offset
-                    span = clip_segment(
-                        shifted_start,
-                        shifted_end,
-                        inset_low_x,
-                        inset_low_y,
-                        inset_high_x,
-                        inset_high_y
-                    )
+        # The obstacle is forced to reach its full width across the
+        # start-goal line rather than along it, so a normal-sized shape
+        # blocks the straight run as widely as its radius allows.
+        spanning_axis = np.array([
+            -goal_direction[1],
+            goal_direction[0],
+        ])
 
-                    if span is None:
-                        raise RuntimeError(
-                            "A shifted shortest-path line does not leave "
-                            "enough room for an obstacle center. Reduce "
-                            "radius."
-                        )
+        anchors = []
 
-                    free_intervals = free_parameter_intervals(
-                        shifted_start,
-                        shifted_end,
-                        span,
-                        polygons
-                    )
-
-                    if not free_intervals:
-                        raise RuntimeError(
-                            "A shifted shortest-path line has no center points "
-                            "in the current Shapely free-space region."
-                        )
-
-                    shifted_segments.append((
-                        shifted_start,
-                        shifted_end,
-                        span,
-                        free_intervals,
-                    ))
-
-                # Use a common interval on which either vertical projection is
-                # a valid center. Shapely line-minus-polygon differences remove
-                # portions lying inside the barriers or corner obstacles. When
-                # several components remain, retain the longest common one so
-                # the centers still form one evenly spaced sequence.
-                common_intervals = intersect_intervals(
-                    shifted_segments[0][3],
-                    shifted_segments[1][3],
+        for goal, inward in ((np.zeros(2), 1.0), (goal_line, -1.0)):
+            # One max_radius from the goal is as close as the obstacle can
+            # sit without covering it. At that distance the two walls
+            # meeting at the corner leave only a narrow band of usable
+            # vertex angles, so a draw occasionally cannot be satisfied at
+            # all; stepping the center outwards along the line recovers it
+            # without moving the obstacle far from the goal.
+            for scale in (1.0, 1.15, 1.35, 1.6, 2.0):
+                obstacle = annulus_obstacle(
+                    goal + inward * scale * max_radius * goal_direction,
+                    rng,
+                    min_vertices,
+                    max_vertices,
+                    min_radius,
+                    max_radius,
+                    polygons,
+                    course_region,
+                    spanning_axis=spanning_axis,
+                    raise_on_failure=False,
                 )
 
-                if not common_intervals:
-                    raise RuntimeError(
-                        "The two shifted shortest-path lines have no common "
-                        "free-space interval for obstacle centers."
-                    )
-
-                common_low, common_high = max(
-                    common_intervals,
-                    key=lambda interval: interval[1] - interval[0],
-                )
-
-                placement_pairs.append((
-                    bridge_start,
-                    bridge_end,
-                    shifted_segments,
-                    (common_low, common_high),
-                ))
-
-            # Allocate obstacles between the two original A-to-B segments
-            # in proportion to their usable lengths. The usable length is the
-            # portion common to both vertically shifted copies, because every
-            # center in the staggered sequence must be projectable to either
-            # line. Largest-remainder rounding preserves the requested total.
-            usable_pair_lengths = np.asarray(
-                [
-                    float(np.linalg.norm(end - start)) * (high - low)
-                    for start, end, _, (low, high) in placement_pairs
-                ],
-                dtype=float,
-            )
-
-            if (
-                np.any(usable_pair_lengths <= 0.0)
-                or usable_pair_lengths.sum() <= 0.0
-            ):
-                raise RuntimeError(
-                    "The selected shortest-path segments have no usable "
-                    "length for obstacle placement."
-                )
-
-            exact_pair_counts = (
-                remaining
-                * usable_pair_lengths
-                / usable_pair_lengths.sum()
-            )
-            pair_counts = np.floor(exact_pair_counts).astype(int)
-            leftover = remaining - int(pair_counts.sum())
-
-            if leftover:
-                remainders = exact_pair_counts - pair_counts
-                # The random secondary key makes exact ties unbiased while
-                # keeping larger fractional remainders ahead of smaller ones.
-                order = np.lexsort((rng.random(len(remainders)), -remainders))
-                pair_counts[order[:leftover]] += 1
-
-            placement_groups = []
-
-            for pair_index, (
-                bridge_start,
-                bridge_end,
-                shifted_segments,
-                (low, high),
-            ) in enumerate(placement_pairs):
-                pair_count = int(pair_counts[pair_index])
-
-                # Split this segment's proportional count as evenly as
-                # possible between its lower and upper shifted lines.
-                line_counts = np.full(2, pair_count // 2, dtype=int)
-                if pair_count % 2:
-                    line_counts[int(rng.integers(0, 2))] += 1
-
-                if pair_count == 0:
-                    continue
-
-                placement_groups.append((
-                    bridge_start,
-                    bridge_end,
-                    low,
-                    high,
-                    line_counts,
-                    pair_count,
-                ))
-
-            # A locally valid early shape can still consume space needed to
-            # form a later polygon. Use bounded group-level backtracking. Each
-            # attempt preserves the proportional counts and exact equal spacing
-            # along every original segment, but may change the common phase of
-            # that arithmetic sequence within its usable interval. This avoids
-            # pathological alignments between the two path-derived line pairs.
-            fixed_polygon_count = len(polygons)
-
-            for _layout_attempt in range(200):
-                del polygons[fixed_polygon_count:]
-                line_centers = []
-
-                for (
-                    bridge_start,
-                    bridge_end,
-                    low,
-                    high,
-                    line_counts,
-                    pair_count,
-                ) in placement_groups:
-                    interval_length = high - low
-                    spacing = interval_length / pair_count
-
-                    # Any phase in [0, spacing] keeps all points inside the
-                    # interval and preserves exact equal spacing. Stay slightly
-                    # away from the interval endpoints to avoid numerical
-                    # contact with an occupied boundary.
-                    phase = rng.uniform(0.1, 0.9) * spacing
-                    fractions = (
-                        low
-                        + phase
-                        + np.arange(pair_count) * spacing
-                    )
-
-                    if line_counts[0] > line_counts[1]:
-                        first_line = 0
-                    elif line_counts[1] > line_counts[0]:
-                        first_line = 1
-                    else:
-                        first_line = int(rng.integers(0, 2))
-
-                    line_sequence = np.array(
-                        [
-                            first_line if index % 2 == 0 else 1 - first_line
-                            for index in range(pair_count)
-                        ],
-                        dtype=int,
-                    )
-
-                    actual_counts = np.bincount(
-                        line_sequence,
-                        minlength=2,
-                    )
-                    if not np.array_equal(actual_counts, line_counts):
-                        raise RuntimeError(
-                            "Internal obstacle-line allocation error."
-                        )
-
-                    bridge_direction = bridge_end - bridge_start
-
-                    for fraction, line_index in zip(
-                        fractions,
-                        line_sequence,
-                        strict=True,
-                    ):
-                        original_center = (
-                            bridge_start + fraction * bridge_direction
-                        )
-                        line_centers.append(
-                            original_center + vertical_offsets[line_index]
-                        )
-
-                layout_succeeded = True
-
-                for center_index, center in enumerate(line_centers):
-                    obstacle = annulus_obstacle(
-                        center,
-                        rng,
-                        min_vertices,
-                        max_vertices,
-                        min_radius,
-                        max_radius,
-                        polygons,
-                        course_region,
-                        forbidden_points=line_centers[center_index + 1:],
-                        max_attempts=800,
-                        raise_on_failure=False,
-                    )
-
-                    if obstacle is None:
-                        layout_succeeded = False
-                        break
-
+                if obstacle is not None:
                     polygons.append(obstacle)
-
-                if layout_succeeded:
+                    anchors.append(obstacle)
                     break
-            else:
-                del polygons[fixed_polygon_count:]
-                raise RuntimeError(
-                    "Could not generate a complete non-overlapping layout "
-                    "after repeated Shapely free-space resampling and evenly "
-                    "spaced center-phase adjustments. Reduce num_obstacles or "
-                    "radius, or increase the course dimensions."
-                )
 
-        return cls(
+        if len(anchors) < 2:
+            return finish(free_layout())
+
+        # ------------------------------------------------------------------
+        # One obstacle straddling each of the two remaining corners
+        # ------------------------------------------------------------------
+
+        # Each obstacle sits a short way inside its corner along the corner
+        # bisector, and is forced to put a vertex on that bisector pointing
+        # outwards. Both of the properties this needs then follow from the
+        # single condition ``corner_offset < min_radius``.
+        #
+        # The polygon is star shaped about its center, so along the outward
+        # ray its boundary is exactly the forced vertex, at radius at least
+        # ``min_radius``. The corner point lies on that same ray at
+        # ``corner_offset``, which is nearer, so the corner is strictly
+        # inside the obstacle and is no longer a place a path may turn. The
+        # forced vertex lies further along the ray than the corner, and past
+        # the corner the bisector leaves the course through both walls at
+        # once, so that vertex is strictly out of bounds and part of the
+        # obstacle is guaranteed to be outside.
+        #
+        # Sitting inside the corner rather than on it is what puts most of
+        # the obstacle in bounds: on the corner only the inward quadrant
+        # counts, whereas here the center clears each wall by
+        # ``corner_offset / sqrt(2)``.
+        #
+        # Reaching past a wall is allowed here and nowhere else, so the
+        # containment test is widened for these two draws alone; overlap
+        # with an already placed obstacle is still forbidden. The outside
+        # vertices are dropped by ``vertices()`` and never reach the
+        # visibility graph.
+        corner_offset = corner_offset_fraction * min_radius
+
+        outside_region = shapely.box(
+            -2.0 * max_radius,
+            -2.0 * max_radius,
+            width + 2.0 * max_radius,
+            height + 2.0 * max_radius,
+        )
+
+        root_half = np.sqrt(0.5)
+
+        for corner, outward in (
+            ((0.0, height), np.array([-root_half, root_half])),
+            ((width, 0.0), np.array([root_half, -root_half])),
+        ):
+            obstacle = annulus_obstacle(
+                np.asarray(corner, dtype=float) - corner_offset * outward,
+                rng,
+                min_vertices,
+                max_vertices,
+                min_radius,
+                max_radius,
+                polygons,
+                course_region,
+                spanning_axis=outward,
+                containment_region=outside_region,
+                raise_on_failure=False,
+            )
+
+            if obstacle is None:
+                return finish(free_layout())
+
+            polygons.append(obstacle)
+
+        # ------------------------------------------------------------------
+        # The two shortest ways past the goal obstacles
+        # ------------------------------------------------------------------
+
+        from .path_planner import PathPlanner
+
+        # Solve the simplified problem using only the two goal obstacles,
+        # so the segments describe the way past them and are not deflected
+        # by the corner clusters.
+        simplified_course = cls(
             width=width,
             height=height,
-            obstacles=polygons,
+            obstacles=list(anchors),
+        )
+        simplified_planner = PathPlanner(
+            obstacle_course=simplified_course,
+            start=np.array([0.0, 0.0]),
+            end=np.array([width, height]),
+        )
+
+        # The planner keys its graph by integer index into `coords`, so the
+        # search runs on indices and the result is mapped back to
+        # coordinates for bridge_segment, which compares against the
+        # obstacles' own vertex tuples.
+        planner_coords = simplified_planner.coords
+
+        obstacle_a_vertices = set(anchors[0].exterior.coords[:-1])
+        obstacle_b_vertices = set(anchors[1].exterior.coords[:-1])
+
+        # Paths arrive in nondecreasing total visibility-graph length, so
+        # the first usable one is the shortest path. After fixing its
+        # bridge (a_i, b_j), continue through the same ordered list and
+        # retain the first path whose bridge (a_k, b_l) satisfies both
+        # a_k != a_i and b_l != b_j. The second selected path is therefore
+        # the shortest one obeying the endpoint-disjointness requirement,
+        # rather than merely one using a different A-to-B edge. That
+        # ordering guarantee is the whole reason a k-shortest-paths routine
+        # is needed here instead of a plain shortest path.
+        #
+        # scipy's yen() is not a lazy generator: K is fixed up front and it
+        # returns at most K paths. The budget is therefore doubled until
+        # either two acceptable bridges are found or the graph is
+        # exhausted, which is signalled by fewer than K paths coming back.
+        chosen_bridges = []
+        budget = _INITIAL_PATH_BUDGET
+
+        while True:
+            candidate_paths = simplified_planner.k_shortest_paths(budget)
+
+            if not candidate_paths:
+                break
+
+            chosen_bridges = []
+            first_a_vertex = None
+            first_b_vertex = None
+
+            for path_indices in candidate_paths:
+                path_vertices = [
+                    tuple(planner_coords[index]) for index in path_indices
+                ]
+                bridge = bridge_segment(
+                    path_vertices,
+                    obstacle_a_vertices,
+                    obstacle_b_vertices,
+                )
+
+                if bridge is None:
+                    continue
+
+                a_vertex, b_vertex = bridge
+
+                if not chosen_bridges:
+                    chosen_bridges.append(bridge)
+                    first_a_vertex = a_vertex
+                    first_b_vertex = b_vertex
+                    continue
+
+                if a_vertex == first_a_vertex or b_vertex == first_b_vertex:
+                    continue
+
+                chosen_bridges.append(bridge)
+                break
+
+            if len(chosen_bridges) >= 2:
+                break
+
+            # Fewer paths than asked for means the graph has no more, so a
+            # larger budget cannot help.
+            if len(candidate_paths) < budget:
+                break
+
+            if budget >= _MAXIMUM_PATH_BUDGET:
+                break
+
+            budget = min(2 * budget, _MAXIMUM_PATH_BUDGET)
+
+        # Translating y by +/- radius gives the two placement lines either
+        # side of each bridge.
+        vertical_offsets = (
+            np.array([0.0, -1.0 * radius]),
+            np.array([0.0, 1.0 * radius]),
+        )
+
+        bridge_specs = []
+
+        for bridge_start, bridge_end in chosen_bridges:
+            bridge_start = np.asarray(bridge_start, dtype=float)
+            bridge_end = np.asarray(bridge_end, dtype=float)
+
+            shifted_intervals = []
+
+            for vertical_offset in vertical_offsets:
+                shifted_start = bridge_start + vertical_offset
+                shifted_end = bridge_end + vertical_offset
+
+                span = clip_segment(
+                    shifted_start,
+                    shifted_end,
+                    inset_low_x,
+                    inset_low_y,
+                    inset_high_x,
+                    inset_high_y,
+                )
+
+                if span is None:
+                    break
+
+                free_intervals = free_parameter_intervals(
+                    shifted_start,
+                    shifted_end,
+                    span,
+                    polygons,
+                )
+
+                if not free_intervals:
+                    break
+
+                shifted_intervals.append(free_intervals)
+
+            if len(shifted_intervals) < 2:
+                continue
+
+            # Use a common interval on which either vertical projection is
+            # a valid center. Shapely line-minus-polygon differences remove
+            # portions lying inside an obstacle already placed. When
+            # several components remain, retain the longest so the centers
+            # still form one evenly spaced run.
+            common_intervals = intersect_intervals(*shifted_intervals)
+
+            if not common_intervals:
+                continue
+
+            common_low, common_high = max(
+                common_intervals,
+                key=lambda interval: interval[1] - interval[0],
+            )
+
+            usable_length = float(
+                np.linalg.norm(bridge_end - bridge_start)
+            ) * (common_high - common_low)
+
+            count = diameter_fit_count(usable_length, diameter)
+
+            if count == 0:
+                continue
+
+            bridge_specs.append((
+                bridge_start,
+                bridge_end,
+                (common_low, common_high),
+                count,
+            ))
+
+        bridge_count = sum(count for *_, count in bridge_specs)
+        needed = len(polygons) + bridge_count
+
+        if num_obstacles < needed:
+            if raise_if_insufficient:
+                raise ValueError(
+                    f"num_obstacles is {num_obstacles} but this layout "
+                    f"needs {needed}: {len(polygons)} for the goal and "
+                    f"corner obstacles and {bridge_count} "
+                    "along the two segments."
+                )
+
+            return finish(free_layout())
+
+        # A locally valid early shape can still consume the space a later
+        # one needs. Retry the whole segment layout, which redraws the
+        # random phase of each evenly spaced run without changing any
+        # count, so an unlucky alignment between the two runs is not
+        # retried identically.
+        fixed_polygon_count = len(polygons)
+
+        for _layout_attempt in range(200):
+            del polygons[fixed_polygon_count:]
+
+            line_centers = [
+                center
+                for bridge_start, bridge_end, span, _count in bridge_specs
+                for center in staggered_centers(
+                    bridge_start,
+                    bridge_end,
+                    span,
+                    diameter,
+                    radius,
+                    rng,
+                )
+            ]
+
+            layout_succeeded = True
+
+            for center_index, center in enumerate(line_centers):
+                obstacle = annulus_obstacle(
+                    center,
+                    rng,
+                    min_vertices,
+                    max_vertices,
+                    min_radius,
+                    max_radius,
+                    polygons,
+                    course_region,
+                    forbidden_points=line_centers[center_index + 1:],
+                    max_attempts=800,
+                    raise_on_failure=False,
+                )
+
+                if obstacle is None:
+                    layout_succeeded = False
+                    break
+
+                polygons.append(obstacle)
+
+            if layout_succeeded:
+                break
+        else:
+            del polygons[fixed_polygon_count:]
+
+        # ------------------------------------------------------------------
+        # Surplus obstacles, placed wherever there is still room
+        # ------------------------------------------------------------------
+
+        place_random_obstacles(
+            num_obstacles - len(polygons),
+            rng,
+            min_vertices,
+            max_vertices,
+            min_radius,
+            max_radius,
+            polygons,
+            course_region,
+            center_region,
+        )
+
+        report_shortfall()
+
+        return finish(
+            cls(
+                width=width,
+                height=height,
+                obstacles=polygons,
+            )
         )
 
     def vertices(self) -> np.ndarray:
         """``(n, 2)`` obstacle corners that a path could turn around.
 
+        Two kinds of corner are dropped. One is buried in the interior of the
+        union, which happens where obstacles meet and is not on any boundary
+        a path could follow. The other lies outside the course: the obstacles
+        covering ``(0, height)`` and ``(width, 0)`` are centred on those
+        corners and so reach past the walls, and a point out there is not
+        somewhere a path may turn. Corners exactly on a wall are kept, since
+        a path is free to turn against one.
+
         Returned as an array rather than a list of tuples so the caller can
         index vertices by integer; the array itself is the index-to-coordinate
         map.
         """
-        points = [
-            point
-            for point in itertools.chain.from_iterable(
+        points = list(
+            itertools.chain.from_iterable(
                 map(
                     lambda obstacle: obstacle.exterior.coords[:-1],
                     self.obstacles,
                 )
             )
-            if not shapely.contains_xy(self.obstacles_region, *point)
-        ]
+        )
 
         if not points:
             return np.zeros((0, 2), dtype=float)
 
-        return np.asarray(points, dtype=float)[:, :2]
+        points = np.asarray(points, dtype=float)[:, :2]
+
+        x = points[:, 0]
+        y = points[:, 1]
+
+        # One batched call each, rather than a predicate per corner.
+        keep = (
+            (x >= 0.0)
+            & (x <= self.width)
+            & (y >= 0.0)
+            & (y <= self.height)
+            & ~shapely.contains_xy(self.obstacles_region, x, y)
+        )
+
+        return points[keep]
 
     def is_visible(self, vertex1, vertex2):
         """Are the segments ``vertex1[k] -> vertex2[k]`` free of every obstacle?
@@ -1001,6 +1105,8 @@ class ObstacleCourse(VisibilityMixin):
         show_labels: bool = False,
         title: str = None,
         show: bool = True,
+        show_legend: bool = True,
+        legend_info=("length", "angle", "pressure"),
         course_units: str = "ft",
         length_units: str | None = None,
         angle_units: str = "degrees",
@@ -1114,12 +1220,14 @@ class ObstacleCourse(VisibilityMixin):
                 linewidth=2.5,
                 linestyle=linestyle,
                 color=color,
-                label=(
-                    f"{name} "
-                    f"(length={path_length * display_scale:.2f} "
-                    f"{normalized_length_units}, "
-                    f"angle={path_angle_radians * angle_scale:.2f} {angle_label}, "
-                    f"pressure={pressure:.3f} psi)"
+                label=legend_label(
+                    name,
+                    legend_info,
+                    length=path_length * display_scale,
+                    angle=path_angle_radians * angle_scale,
+                    pressure=pressure,
+                    length_units=normalized_length_units,
+                    angle_units=angle_label,
                 ),
                 zorder=zorder,
             )
@@ -1144,13 +1252,25 @@ class ObstacleCourse(VisibilityMixin):
         # maximum. An opaque frame is part of the same fix: at the default
         # framealpha the obstacles show through the box and the entries are
         # no easier to read for being on top.
-        legend = ax.legend(framealpha=1.0)
-        legend.set_zorder(_LEGEND_ZORDER)
+        if show_legend:
+            legend = ax.legend(framealpha=1.0)
+            legend.set_zorder(_LEGEND_ZORDER)
 
         if show:
             plt.show()
 
         return fig, ax
+
+    def to_tikz(self, start=None, end=None, *args, **kwargs) -> str:
+        """PGFPlots/TikZ source for this course; see ``tikz.course_tikz``.
+
+        Imported here rather than at module scope because the exporter needs
+        this module's unit handling, and a top-level import would close the
+        cycle.
+        """
+        from .tikz import course_tikz
+
+        return course_tikz(self, start, end, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

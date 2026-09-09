@@ -2,8 +2,9 @@ import numpy as np
 import itertools
 import shapely
 
+from functools import lru_cache
+
 from shapely import Polygon, LineString, Point
-from scipy.spatial import ConvexHull, QhullError
 from .constants import (
     YIELD_PRESSURE_PSI,
     LENGTH_FRICTION_PSI_PER_FT,
@@ -222,6 +223,239 @@ def path_pressure(
     )
 
 
+# ------------------------------------------------------------------
+# Legend text
+# ------------------------------------------------------------------
+#
+# Shared by the Matplotlib plots and the TikZ export so the two cannot
+# report a path differently. Every quantity is optional: a paper figure
+# usually wants the pressure and nothing else, while a working figure
+# wants all three.
+
+_DEFAULT_LEGEND_FIELDS = ("length", "angle", "pressure")
+
+_LEGEND_FIELD_ALIASES = {
+    "length": "length",
+    "distance": "length",
+    "len": "length",
+    "angle": "angle",
+    "turning": "angle",
+    "turn": "angle",
+    "pressure": "pressure",
+}
+
+
+def normalize_legend_fields(fields=_DEFAULT_LEGEND_FIELDS) -> tuple[str, ...]:
+    """Resolve a legend-field selection to canonical names, order preserved.
+
+    Accepts ``True`` / ``None`` for all three, ``False`` / ``()`` for none, a
+    single name, or any sequence of names. ``"distance"`` is a synonym for
+    ``"length"``: the path is named for the objective it minimises, the
+    quantity reported is the length of it.
+    """
+    if fields is None or fields is True:
+        return _DEFAULT_LEGEND_FIELDS
+
+    if fields is False:
+        return ()
+
+    if isinstance(fields, str):
+        fields = (fields,)
+
+    resolved = []
+
+    for name in fields:
+        canonical = _LEGEND_FIELD_ALIASES.get(str(name).lower())
+
+        if canonical is None:
+            raise ValueError(
+                "legend fields must be drawn from 'length' (or 'distance'), "
+                f"'angle' and 'pressure'; got {name!r}."
+            )
+
+        if canonical not in resolved:
+            resolved.append(canonical)
+
+    return tuple(resolved)
+
+
+def legend_label(
+    name: str,
+    fields=_DEFAULT_LEGEND_FIELDS,
+    *,
+    length: float = None,
+    angle: float = None,
+    pressure: float = None,
+    length_units: str = "ft",
+    angle_units: str = "deg",
+    pressure_name: str = "pressure",
+) -> str:
+    """``"min pressure (length=48.37 ft, pressure=3.857 psi)"``.
+
+    A field is omitted when it was not selected *or* when its value was not
+    supplied, so a caller that has no angle to report does not have to edit
+    its field list to match.
+    """
+    values = {"length": length, "angle": angle, "pressure": pressure}
+    units = {"length": length_units, "angle": angle_units, "pressure": "psi"}
+    formats = {"length": ".2f", "angle": ".2f", "pressure": ".3f"}
+    labels = {"length": "length", "angle": "angle", "pressure": pressure_name}
+
+    parts = [
+        f"{labels[field]}={values[field]:{formats[field]}} {units[field]}"
+        for field in normalize_legend_fields(fields)
+        if values[field] is not None
+    ]
+
+    return f"{name} ({', '.join(parts)})" if parts else name
+
+
+# ------------------------------------------------------------------
+# How many obstacles fit
+# ------------------------------------------------------------------
+
+
+class ObstacleCapacityWarning(UserWarning):
+    """A course was asked for more obstacles than it can hold.
+
+    Its own category so it can be silenced or promoted to an error with
+    ``warnings.filterwarnings`` without touching anything else.
+    """
+
+
+@lru_cache(maxsize=None)
+def _shape_coefficient(
+    min_vertices: int,
+    max_vertices: int,
+    samples: int = 4096,
+    seed: int = 0,
+) -> float:
+    """Mean obstacle area divided by mean radius squared.
+
+    The shoelace area of a polygon that is star shaped about its center is
+
+        A = 0.5 * sum_i r_i r_{i+1} sin(theta_{i+1} - theta_i),
+
+    and ``annulus_obstacle`` draws the radii independently of the angles and
+    of each other. Consecutive radii are therefore independent, so
+    ``E[r_i r_{i+1}] = E[r]^2`` and the whole expectation factors as
+
+        E[A] = E[r]^2 * (0.5 * E[sum_i sin(gap_i)]).
+
+    The bracketed term is dimensionless and depends only on the vertex-count
+    range, which is why this is cached: the Monte Carlo runs once per range
+    per process rather than once per course.
+
+    It is estimated rather than derived because ``sample_angles`` rejects any
+    draw whose largest gap reaches pi, and that conditioning has no tidy
+    closed form -- it also bites hardest at three vertices, where it throws
+    away three draws in four. Calling ``sample_angles`` here keeps the
+    estimate correct if the angle law is ever changed; a hand-derived formula
+    would silently stop matching.
+    """
+    rng = np.random.default_rng(seed)
+    total = 0.0
+
+    for _ in range(samples):
+        count = int(rng.integers(min_vertices, max_vertices + 1))
+        angles = sample_angles(count, rng)
+        radii = rng.uniform(0.0, 2.0, count)
+
+        total += 0.5 * float(np.sum(
+            radii * np.roll(radii, -1) * np.sin(np.roll(angles, -1) - angles)
+        ))
+
+    # The radii above have mean 1, so dividing by E[r]^2 = 1 is a no-op and
+    # the average is already the coefficient.
+    return abs(total / samples)
+
+
+def expected_obstacle_area(
+    min_vertices: int,
+    max_vertices: int,
+    min_radius: float,
+    max_radius: float,
+) -> float:
+    """Mean area of one obstacle as ``annulus_obstacle`` would draw it.
+
+    This is the area of an *unconditional* draw. Obstacles that survive the
+    overlap test are smaller on average, because a large draw is likelier to
+    be rejected: on a saturated 25 ft course the accepted obstacles averaged
+    1.26 square feet against 1.63 for the draws. ``obstacle_capacity``
+    accounts for that in its coefficient, so do not correct for it twice.
+    """
+    mean_radius = 0.5 * (float(min_radius) + float(max_radius))
+
+    return _shape_coefficient(int(min_vertices), int(max_vertices)) * mean_radius ** 2
+
+
+def obstacle_capacity(
+    width: float,
+    height: float,
+    min_vertices: int,
+    max_vertices: int,
+    min_radius: float,
+    max_radius: float,
+    packing_coefficient: float = 0.65,
+) -> int:
+    """Roughly the largest number of obstacles that will fit.
+
+    ``packing_coefficient`` is *not* an area fraction. It is an empirical
+    constant absorbing two effects at once: how densely sequential random
+    placement can pack before it runs out of room, and the downward size bias
+    of the obstacles that survive rejection. Measured on saturated 25 ft
+    courses it sat between 0.53 and 0.61 over radii from 0.45 to 2.0, a 4.4x
+    range; the default is set above that so the number is a ceiling rather
+    than a target. The intent is to catch a request that cannot be met at
+    all, not to second-guess one that merely works the sampler hard.
+
+    The estimate is optimistic when obstacles are large relative to the
+    course, since centers are confined to an inset box while the area
+    accounting is not. Treat it as an order of magnitude, and rely on the
+    post-generation shortfall warning for the rest.
+    """
+    mean_area = expected_obstacle_area(
+        min_vertices, max_vertices, min_radius, max_radius
+    )
+
+    if mean_area <= 0.0:
+        return 0
+
+    return int(packing_coefficient * float(width) * float(height) / mean_area)
+
+
+def suggested_radius(
+    width: float,
+    height: float,
+    num_obstacles: int,
+    min_vertices: int,
+    max_vertices: int,
+    annulus_offset: float,
+    packing_coefficient: float = 0.65,
+    margin: float = 1.25,
+) -> float:
+    """The ``radius`` at which ``num_obstacles`` would comfortably fit.
+
+    Inverts ``obstacle_capacity``. Mean area goes as the square of the mean
+    radius, so the target mean radius follows directly; ``annulus_offset`` is
+    ``max_radius - min_radius``, subtracted back off to return the inner
+    radius the caller actually passes.
+
+    ``margin`` sizes for more obstacles than were asked for, and is not
+    optional padding. ``obstacle_capacity`` reports a ceiling, and sequential
+    placement stalls well before a ceiling: sizing a 301-obstacle request
+    exactly at capacity produced 277. Sizing it for 376 instead lands at a
+    radius where the request is met outright.
+    """
+    coefficient = _shape_coefficient(int(min_vertices), int(max_vertices))
+
+    target_count = max(float(margin) * max(num_obstacles, 1), 1.0)
+    target_area = packing_coefficient * float(width) * float(height) / target_count
+    target_mean_radius = np.sqrt(target_area / coefficient)
+
+    return max(float(target_mean_radius) - 0.5 * float(annulus_offset), 0.0)
+
+
 def path_metrics(path: LineString) -> tuple[float, float]:
     """Return path length and cumulative unsigned turning angle.
 
@@ -336,20 +570,6 @@ def pressure_profile(
 # Sampling helpers
 # ------------------------------------------------------------------
 
-def sample_box(
-    low_x: float,
-    low_y: float,
-    high_x: float,
-    high_y: float,
-    count: int,
-    rng: np.random.Generator,
-    epsilon: float
-) -> np.ndarray:
-    return np.column_stack((
-        rng.uniform(low_x + epsilon, high_x - epsilon, count),
-        rng.uniform(low_y + epsilon, high_y - epsilon, count),
-    ))
-
 def sample_uniform_points(
     region,
     number_of_points: int,
@@ -415,85 +635,6 @@ def sample_uniform_points(
         )[:, None] * point_c
     )
 
-def sample_outside_hull(quadrant_polygon, hull_points, rng):
-    """One point of the quadrant lying outside the current hull.
-
-    Cutting the hull out of the quadrant first is what makes the
-    new point a vertex of the grown hull rather than something
-    that might land inside it.
-    """
-    region = quadrant_polygon.difference(Polygon(hull_points))
-
-    if region.is_empty or region.area <= 0.0:
-        return None
-
-    try:
-        return sample_uniform_points(region, 1, rng)
-    except RuntimeError:
-        return None
-
-# ------------------------------------------------------------------
-# Corner barriers
-# ------------------------------------------------------------------
-
-def grow_barrier(quadrant, first_strip, second_strip, rng, min_vertices, max_vertices, epsilon) -> np.ndarray:
-    vertex_target = int(
-        rng.integers(min_vertices, max_vertices + 1)
-    )
-
-    quadrant_polygon = shapely.box(*quadrant)
-
-    required = np.vstack((
-        sample_box(*first_strip, 1, rng, epsilon),
-        sample_box(*second_strip, 1, rng, epsilon),
-    ))
-
-    # A hull needs three points to start from. The retry is only
-    # for a genuinely degenerate draw, three near collinear
-    # points, not for where the points landed.
-    for _ in range(20):
-        points = np.vstack((
-            required,
-            sample_box(*quadrant, 1, rng, epsilon),
-        ))
-
-        try:
-            hull = ConvexHull(points)
-        except QhullError:
-            continue
-
-        break
-    else:
-        raise RuntimeError(
-            "Could not build a starting triangle for the barrier."
-        )
-
-    hull_points = points[hull.vertices]
-
-    for _ in range(vertex_target - 3):
-        extra = sample_outside_hull(
-            quadrant_polygon,
-            hull_points,
-            rng
-        )
-
-        if extra is None:
-            break
-
-        candidate = np.vstack((points, extra))
-
-        try:
-            hull = ConvexHull(candidate)
-        except QhullError:
-            break
-
-        points = candidate
-        hull_points = points[hull.vertices]
-
-    # ConvexHull lists vertices counterclockwise in two
-    # dimensions, so this is already a valid ring.
-    return hull_points
-
 # ------------------------------------------------------------------
 # Standard obstacles
 # ------------------------------------------------------------------
@@ -540,6 +681,8 @@ def annulus_obstacle(
     course_region: Polygon,
     *,
     forbidden_points=(),
+    spanning_axis=None,
+    containment_region: Polygon = None,
     max_attempts: int = 5000,
     raise_on_failure: bool = True,
 
@@ -556,9 +699,27 @@ def annulus_obstacle(
     ``forbidden_points`` are future line centers. Rejecting candidates
     that cover any of them prevents an earlier obstacle from consuming
     the center needed by a later obstacle.
+
+    ``containment_region`` replaces ``course_region`` when an obstacle is
+    allowed to reach past the course walls, which only the two corner
+    obstacles are. It relaxes the wall constraint alone: the region still
+    has the placed polygons subtracted from it, so overlap with an
+    existing obstacle stays forbidden.
+
+    ``spanning_axis`` forces two of the vertices onto the line through
+    the center in that direction, one on each side, each at its own
+    radius drawn from the annulus, and places one further vertex on each
+    side of that line so the ray along the axis runs through the
+    obstacle's interior rather than along an edge. Four vertices are
+    therefore the minimum when an axis is given. The obstacle then reaches its full
+    width across that direction instead of whatever width the angles
+    happened to give it, which is how a normal-sized obstacle is made to
+    block a specific line. Two opposite vertices also cap every angular
+    gap at pi, so the sorted polygon cannot self-intersect.
     """
     center = np.asarray(center, dtype=float)
-    free_space = shapely.difference(course_region, shapely.union_all(polygons))
+    region = course_region if containment_region is None else containment_region
+    free_space = shapely.difference(region, shapely.union_all(polygons))
     center_point = Point(center)
     forbidden_geometry = (
         shapely.points(np.asarray(forbidden_points, dtype=float))
@@ -575,12 +736,52 @@ def annulus_obstacle(
 
         return None
 
+    # A spanning axis needs one free vertex on each side of it, so three
+    # vertices is not enough: two of them are the forced pair and the third
+    # can only sit on one side.
+    lowest_vertices = max(min_vertices, 4 if spanning_axis is not None else 3)
+    highest_vertices = max(max_vertices, lowest_vertices)
+
     for _ in range(max_attempts):
         number_of_vertices = int(
-            rng.integers(min_vertices, max_vertices + 1)
+            rng.integers(lowest_vertices, highest_vertices + 1)
         )
 
-        angles = sample_angles(number_of_vertices, rng)
+        if spanning_axis is None:
+            angles = sample_angles(number_of_vertices, rng)
+        else:
+            # The two forced vertices sit half a turn apart on the
+            # spanning axis; the rest are ordinary uniform draws. Sorting
+            # the combined set keeps the polygon star shaped about the
+            # center, and no gap can exceed pi because the forced pair
+            # already splits the circle in half.
+            axis_angle = np.arctan2(
+                float(spanning_axis[1]),
+                float(spanning_axis[0]),
+            )
+
+            # One free vertex is placed on each side of the axis before the
+            # rest are drawn over the whole circle. Left to chance they can
+            # all land on one side, which leaves a gap of exactly pi: the
+            # edge joining the forced pair then runs straight through the
+            # center, so the center and every point along the axis ray lie
+            # on the boundary rather than inside it. Straddling makes every
+            # gap strictly less than pi, which puts the whole ray out to the
+            # forced vertex in the interior.
+            angles = np.sort(np.mod(
+                np.concatenate((
+                    [axis_angle, axis_angle + np.pi],
+                    axis_angle + rng.uniform(0.0, np.pi, 2)
+                    + [0.0, np.pi],
+                    rng.uniform(
+                        0.0,
+                        2.0 * np.pi,
+                        number_of_vertices - 4,
+                    ),
+                )),
+                2.0 * np.pi,
+            ))
+
         radii = rng.uniform(
             min_radius,
             max_radius,
@@ -637,17 +838,6 @@ def annulus_obstacle(
 # ------------------------------------------------------------------
 # Clusters in the two corners the barriers do not reach
 # ------------------------------------------------------------------
-
-def corner_interval(
-    target: float,
-    low: float,
-    high: float,
-    span: float,
-) -> tuple[float, float]:
-    if target <= low:
-        return low, min(low + span, high)
-
-    return max(high - span, low), high
 
 def clip_segment(
     start: np.ndarray,
@@ -791,3 +981,166 @@ def bridge_segment(path_vertices, obstacle_a_vertices, obstacle_b_vertices):
         return None
 
     return crossings[0]
+
+# ------------------------------------------------------------------
+# Chains of small obstacles
+# ------------------------------------------------------------------
+
+def diameter_fit_count(length: float, diameter: float) -> int:
+    """How many obstacle diameters fit strictly inside ``length``.
+
+    The count is the largest ``n`` with ``n * diameter < length``, so a
+    segment exactly eleven diameters long takes ten obstacles rather than
+    eleven and the chain never runs flush to the ends of its own segment.
+    """
+    if diameter <= 0.0:
+        raise ValueError("diameter must be positive.")
+
+    if length <= 0.0:
+        return 0
+
+    return max(int(np.ceil(length / diameter)) - 1, 0)
+
+
+def chain_offsets(
+    length: float,
+    diameter: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Arc-length positions of an evenly spaced chain inside ``length``.
+
+    Consecutive centers sit exactly one diameter apart. Spacing the chain
+    by the diameter rather than by ``length / (count + 1)`` is what makes
+    non-overlap structural: two obstacles whose vertices never exceed
+    ``max_radius`` from their centers cannot meet once those centers are a
+    full diameter apart, whatever the annulus draw does.
+
+    The leftover slack, always at least one diameter by the definition of
+    the count, becomes a random offset of the chain as a whole, so a
+    repeated attempt is not a repeat of the same layout.
+    """
+    count = diameter_fit_count(length, diameter)
+
+    if count == 0:
+        return np.zeros(0, dtype=float)
+
+    slack = length - (count - 1) * diameter
+
+    return rng.uniform(0.0, slack) + np.arange(count) * diameter
+
+
+def staggered_centers(
+    start: np.ndarray,
+    end: np.ndarray,
+    span: tuple[float, float],
+    diameter: float,
+    vertical_offset: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Evenly spaced centers along a segment, alternating above and below.
+
+    Points are laid out on the segment itself and then projected
+    vertically onto two copies of it, one shifted up by
+    ``vertical_offset`` and one down, taking alternate points. Staggering
+    neighbours this way keeps them from sitting nose to tail and widens
+    the gap between consecutive centers beyond the diameter.
+    """
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+
+    direction = end - start
+    total_length = float(np.linalg.norm(direction))
+
+    if total_length <= 0.0:
+        return np.zeros((0, 2), dtype=float)
+
+    low, high = span
+    offsets = chain_offsets(total_length * (high - low), diameter, rng)
+
+    if offsets.size == 0:
+        return np.zeros((0, 2), dtype=float)
+
+    parameters = low + offsets / total_length
+    centers = start + parameters[:, None] * direction
+
+    # Which side the chain starts on is a free choice, so it is randomised
+    # rather than always beginning above the line.
+    leading_sign = 1.0 if rng.random() < 0.5 else -1.0
+    signs = leading_sign * np.where(
+        np.arange(len(centers)) % 2 == 0,
+        1.0,
+        -1.0,
+    )
+
+    centers[:, 1] += signs * vertical_offset
+
+    return centers
+
+
+# Fraction of ``corner_fraction`` below which a chain segment is not drawn.
+# Near the corner the wall margin eats most of the segment, so a low draw
+# leaves room for no obstacle at all and the corner goes unblocked. Holding
+# the draw to the outer fifth of the permitted range keeps every chain long
+# enough to matter while staying inside that range.
+def place_random_obstacles(
+    count: int,
+    rng: np.random.Generator,
+    min_vertices: int,
+    max_vertices: int,
+    min_radius: float,
+    max_radius: float,
+    polygons: list[Polygon],
+    course_region: Polygon,
+    center_region: Polygon,
+    attempts_per_obstacle: int = 64,
+) -> int:
+    """Add obstacles whose centers are drawn from the remaining free space.
+
+    Sampling the center out of ``center_region`` with everything placed so
+    far removed is what stops a center landing inside an existing
+    obstacle; the annulus sampler then rejects any candidate whose body
+    would overlap. Returns how many were actually placed, which falls
+    short of ``count`` only when the course has run out of room.
+    """
+    placed = 0
+
+    for _ in range(count):
+        free_space = shapely.difference(
+            center_region,
+            shapely.union_all(polygons),
+        )
+
+        if free_space.is_empty or free_space.area <= 0.0:
+            return placed
+
+        try:
+            candidates = sample_uniform_points(
+                free_space,
+                attempts_per_obstacle,
+                rng,
+            )
+        except RuntimeError:
+            return placed
+
+        for center in candidates:
+            obstacle = annulus_obstacle(
+                center,
+                rng,
+                min_vertices,
+                max_vertices,
+                min_radius,
+                max_radius,
+                polygons,
+                course_region,
+                max_attempts=64,
+                raise_on_failure=False,
+            )
+
+            if obstacle is not None:
+                polygons.append(obstacle)
+                placed += 1
+                break
+        else:
+            return placed
+
+    return placed
