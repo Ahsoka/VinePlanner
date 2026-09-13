@@ -2,13 +2,12 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import warnings
 import numpy as np
-import itertools
-import shapely
+
+from matplotlib.patches import Polygon as MatplotlibPolygon
+from numba import njit, prange
 
 from .constants import _LENGTH_TO_FEET
-from shapely.plotting import plot_polygon
 from attrs import define, field, validators
-from shapely import Polygon
 from .utils import (
     clip_segment,
     legend_label,
@@ -21,11 +20,12 @@ from .utils import (
     bridge_segment,
     annulus_obstacle,
     staggered_centers,
-    sample_uniform_points,
     intersect_intervals,
     diameter_fit_count,
     place_random_obstacles,
-    free_parameter_intervals
+    free_parameter_intervals,
+    polygon_is_convex,
+    polygon_half_spaces,
 )
 
 
@@ -54,13 +54,6 @@ _DEFAULT_MAXIMUM_OBSTACLES = 40
 # course in both axes.
 _GOAL_BOX_FRACTION = 0.25
 
-# How far `ObstacleCourse` shrinks its obstacle region to build the eroded
-# copy `is_visible` tests against, as a fraction of the smaller course
-# dimension. See the note in `__attrs_post_init__` for why the eroded set
-# exists; the value only has to sit between double-precision noise at the
-# coordinate magnitudes involved and the smallest real feature, which leaves
-# several orders of magnitude of room either side.
-_EROSION_FRACTION = 1e-9
 
 
 def _length_conversion(source_units: str, target_units: str) -> float:
@@ -110,20 +103,536 @@ def _relabel_axis(axis, limits, display_scale: float) -> None:
     )
 
 
+# ---------------------------------------------------------------------- #
+# Visibility kernel
+# ---------------------------------------------------------------------- #
+#
+# Every obstacle in this package is a convex polytope stored in half-space
+# form, which is what lets one kernel serve the 2D and the 3D course alike.
+# Coordinates are carried in three columns throughout: a 2D course embeds at
+# z = 0 and pads its normals with a zero third component, which makes each of
+# its obstacles a prism extruded infinitely in z. Since every query point
+# also has z = 0, the extrusion is invisible to the arithmetic and the same
+# compiled function handles both dimensions.
+#
+# Why a grid walk rather than a bounding-box query. A segment of length L
+# passes near O(L) obstacles but its bounding box contains O(L^2) of them, so
+# an envelope query hands the narrow phase a candidate set that grows with
+# the square of the course while the true answer grows linearly. Stepping
+# cell by cell along the segment queries a one-dimensional set instead, and
+# because most segments in a dense course are blocked almost immediately, the
+# walk usually terminates in the first cell or two regardless of course size.
+#
+# Why Cyrus-Beck rather than edge crossings. Writing the segment as
+# x(t) = p + t (q - p) and the obstacle as a_i . x + b_i <= 0, each face
+# distance is affine in t, so g(t) = max_i (a_i . x(t) + b_i) is convex and
+# piecewise linear. Clipping gives [t0, t1], the whole of the segment meeting
+# the closed obstacle, and g vanishes at both ends of it. Convexity then
+# leaves exactly two possibilities: g is identically zero across the
+# interval, meaning the segment only skims the surface, or strictly negative
+# throughout, meaning it passes through. Probing the midpoint separates them,
+# so one evaluation per obstacle decides it. A skim stays visible on purpose:
+# a path is allowed to hug a wall.
+
+
+@njit(cache=True, nogil=True)
+def _segment_blocked(
+    start,
+    end,
+    normals,
+    offsets,
+    facet_indptr,
+    grid_indptr,
+    grid_items,
+    grid_origin,
+    grid_cell,
+    grid_shape,
+    tol,
+):
+    """Does this one segment pass through the interior of any obstacle?
+
+    Walks the uniform grid from ``start`` to ``end`` with the standard
+    incremental traversal, testing the obstacles binned in each cell and
+    stopping at the first one the segment penetrates. An obstacle spanning
+    several visited cells may be tested more than once, which costs a little
+    arithmetic but cannot change the answer.
+    """
+    direction_x = end[0] - start[0]
+    direction_y = end[1] - start[1]
+    direction_z = end[2] - start[2]
+
+    # Cell the segment starts in, and the one it ends in.
+    index_x = int(np.floor((start[0] - grid_origin[0]) / grid_cell))
+    index_y = int(np.floor((start[1] - grid_origin[1]) / grid_cell))
+    index_z = int(np.floor((start[2] - grid_origin[2]) / grid_cell))
+
+    final_x = int(np.floor((end[0] - grid_origin[0]) / grid_cell))
+    final_y = int(np.floor((end[1] - grid_origin[1]) / grid_cell))
+    final_z = int(np.floor((end[2] - grid_origin[2]) / grid_cell))
+
+    step_x = 1 if direction_x > 0.0 else (-1 if direction_x < 0.0 else 0)
+    step_y = 1 if direction_y > 0.0 else (-1 if direction_y < 0.0 else 0)
+    step_z = 1 if direction_z > 0.0 else (-1 if direction_z < 0.0 else 0)
+
+    huge = 1.0e30
+
+    delta_x = grid_cell / abs(direction_x) if direction_x != 0.0 else huge
+    delta_y = grid_cell / abs(direction_y) if direction_y != 0.0 else huge
+    delta_z = grid_cell / abs(direction_z) if direction_z != 0.0 else huge
+
+    if direction_x != 0.0:
+        boundary = grid_origin[0] + (index_x + (1 if step_x > 0 else 0)) * grid_cell
+        next_x = (boundary - start[0]) / direction_x
+    else:
+        next_x = huge
+
+    if direction_y != 0.0:
+        boundary = grid_origin[1] + (index_y + (1 if step_y > 0 else 0)) * grid_cell
+        next_y = (boundary - start[1]) / direction_y
+    else:
+        next_y = huge
+
+    if direction_z != 0.0:
+        boundary = grid_origin[2] + (index_z + (1 if step_z > 0 else 0)) * grid_cell
+        next_z = (boundary - start[2]) / direction_z
+    else:
+        next_z = huge
+
+    cells_x = grid_shape[0]
+    cells_y = grid_shape[1]
+    cells_z = grid_shape[2]
+
+    while True:
+        if (
+            0 <= index_x < cells_x
+            and 0 <= index_y < cells_y
+            and 0 <= index_z < cells_z
+        ):
+            cell = (index_x * cells_y + index_y) * cells_z + index_z
+
+            for slot in range(grid_indptr[cell], grid_indptr[cell + 1]):
+                obstacle = grid_items[slot]
+
+                enter = 0.0
+                leave = 1.0
+                separated = False
+
+                for facet in range(
+                    facet_indptr[obstacle], facet_indptr[obstacle + 1]
+                ):
+                    denominator = (
+                        normals[facet, 0] * direction_x
+                        + normals[facet, 1] * direction_y
+                        + normals[facet, 2] * direction_z
+                    )
+                    numerator = (
+                        normals[facet, 0] * start[0]
+                        + normals[facet, 1] * start[1]
+                        + normals[facet, 2] * start[2]
+                        + offsets[facet]
+                    )
+
+                    if -tol < denominator < tol:
+                        # Parallel to this face: the face either excludes the
+                        # whole segment or constrains nothing.
+                        if numerator > tol:
+                            separated = True
+                            break
+
+                        continue
+
+                    crossing = -numerator / denominator
+
+                    if denominator > 0.0:
+                        if crossing < leave:
+                            leave = crossing
+                    else:
+                        if crossing > enter:
+                            enter = crossing
+
+                    if enter > leave:
+                        separated = True
+                        break
+
+                if separated:
+                    continue
+
+                # g is convex and vanishes at both ends of [enter, leave], so
+                # its sign at the midpoint decides skim against penetration.
+                middle = 0.5 * (enter + leave)
+                probe_x = start[0] + middle * direction_x
+                probe_y = start[1] + middle * direction_y
+                probe_z = start[2] + middle * direction_z
+
+                worst = -1.0e30
+
+                for facet in range(
+                    facet_indptr[obstacle], facet_indptr[obstacle + 1]
+                ):
+                    value = (
+                        normals[facet, 0] * probe_x
+                        + normals[facet, 1] * probe_y
+                        + normals[facet, 2] * probe_z
+                        + offsets[facet]
+                    )
+
+                    if value > worst:
+                        worst = value
+
+                if worst < -tol:
+                    return True
+
+        if index_x == final_x and index_y == final_y and index_z == final_z:
+            return False
+
+        if next_x < next_y:
+            if next_x < next_z:
+                if next_x > 1.0:
+                    return False
+                index_x += step_x
+                next_x += delta_x
+            else:
+                if next_z > 1.0:
+                    return False
+                index_z += step_z
+                next_z += delta_z
+        else:
+            if next_y < next_z:
+                if next_y > 1.0:
+                    return False
+                index_y += step_y
+                next_y += delta_y
+            else:
+                if next_z > 1.0:
+                    return False
+                index_z += step_z
+                next_z += delta_z
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _points_inside(
+    points,
+    normals,
+    offsets,
+    facet_indptr,
+    grid_indptr,
+    grid_items,
+    grid_origin,
+    grid_cell,
+    grid_shape,
+    tol,
+):
+    """``(n,)`` bool: is each point inside some obstacle?
+
+    A point inside an obstacle is inside that obstacle's bounding box, so it
+    lands in a cell the obstacle was binned into and only that cell's
+    occupants have to be tested. The cost is therefore proportional to the
+    number of points times the typical cell occupancy, rather than to points
+    times obstacles.
+    """
+    count = points.shape[0]
+    out = np.zeros(count, dtype=np.bool_)
+
+    cells_x = grid_shape[0]
+    cells_y = grid_shape[1]
+    cells_z = grid_shape[2]
+
+    for k in prange(count):
+        index_x = int(np.floor((points[k, 0] - grid_origin[0]) / grid_cell))
+        index_y = int(np.floor((points[k, 1] - grid_origin[1]) / grid_cell))
+        index_z = int(np.floor((points[k, 2] - grid_origin[2]) / grid_cell))
+
+        if not (
+            0 <= index_x < cells_x
+            and 0 <= index_y < cells_y
+            and 0 <= index_z < cells_z
+        ):
+            continue
+
+        cell = (index_x * cells_y + index_y) * cells_z + index_z
+
+        for slot in range(grid_indptr[cell], grid_indptr[cell + 1]):
+            obstacle = grid_items[slot]
+            inside = True
+
+            for facet in range(
+                facet_indptr[obstacle], facet_indptr[obstacle + 1]
+            ):
+                value = (
+                    normals[facet, 0] * points[k, 0]
+                    + normals[facet, 1] * points[k, 1]
+                    + normals[facet, 2] * points[k, 2]
+                    + offsets[facet]
+                )
+
+                if value > tol:
+                    inside = False
+                    break
+
+            if inside:
+                out[k] = True
+                break
+
+    return out
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _visible_paired(
+    starts,
+    ends,
+    normals,
+    offsets,
+    facet_indptr,
+    grid_indptr,
+    grid_items,
+    grid_origin,
+    grid_cell,
+    grid_shape,
+    tol,
+):
+    """``(n,)`` bool for the segments ``starts[k] -> ends[k]``."""
+    count = starts.shape[0]
+    out = np.empty(count, dtype=np.bool_)
+
+    for k in prange(count):
+        out[k] = not _segment_blocked(
+            starts[k],
+            ends[k],
+            normals,
+            offsets,
+            facet_indptr,
+            grid_indptr,
+            grid_items,
+            grid_origin,
+            grid_cell,
+            grid_shape,
+            tol,
+        )
+
+    return out
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def _visible_block(
+    points,
+    first_row,
+    last_row,
+    normals,
+    offsets,
+    facet_indptr,
+    grid_indptr,
+    grid_items,
+    grid_origin,
+    grid_cell,
+    grid_shape,
+    tol,
+):
+    """Dense visibility for rows ``[first_row, last_row)`` against all points.
+
+    Only the strict upper triangle is filled; entries at or below the
+    diagonal stay ``False``, so the caller can read the block straight out
+    without masking it.
+    """
+    count = points.shape[0]
+    out = np.zeros((last_row - first_row, count), dtype=np.bool_)
+
+    for row in prange(first_row, last_row):
+        for column in range(row + 1, count):
+            out[row - first_row, column] = not _segment_blocked(
+                points[row],
+                points[column],
+                normals,
+                offsets,
+                facet_indptr,
+                grid_indptr,
+                grid_items,
+                grid_origin,
+                grid_cell,
+                grid_shape,
+                tol,
+            )
+
+    return out
+
+
 class VisibilityMixin:
-    """All-pairs visibility on top of a course's batched ``is_visible``.
+    """Visibility for a course whose obstacles are convex polytopes.
 
-    A course only has to answer "are these segments clear?"; turning that into
-    the pair list a visibility graph needs is identical for every course, so it
-    lives here rather than in each class.
+    A course supplies geometry and nothing else: ``half_spaces()`` returns
+    the obstacle faces, and this mixin owns every visibility question asked
+    of them. That is the whole reason the 2D and 3D courses no longer carry
+    an ``is_visible`` apiece -- the predicate never depended on how a course
+    described its obstacles, only on the faces those obstacles reduce to.
 
-    Chunking is the reason this is not left to the caller. The pair count grows
-    as ``n**2``: at 5,000 vertices that is 12.5 million pairs, and the index
-    arrays alone run to hundreds of megabytes before any geometry is touched.
+    The spatial index is built once on first use and cached. It is keyed on
+    the identity of the half-space arrays, so a course that rebuilds its
+    geometry gets a fresh index without having to know this class exists.
     """
 
-    def visible_pairs(self, points, chunk: int = 2_000_000):
-        """Index arrays ``(i, j)``, ``i < j``, of every mutually visible pair."""
+    #: Cell size as a multiple of the mean obstacle extent. One obstacle per
+    #: cell keeps the per-cell occupancy near unity: smaller cells spend more
+    #: time stepping than testing, larger ones test obstacles the segment was
+    #: never near.
+    _CELL_FACTOR = 1.0
+
+    def half_spaces(self):
+        """``(normals, offsets, facet_indptr, bounds)`` for the obstacles.
+
+        ``normals`` is ``(F, 3)`` of outward unit rows and ``offsets`` is
+        ``(F,)``, so obstacle ``i`` is the set of points satisfying
+        ``normals[s] . x + offsets[s] <= 0`` for every ``s`` in
+        ``facet_indptr[i] : facet_indptr[i + 1]``. ``bounds`` is
+        ``(n_obstacles, 6)`` as ``(low, high)`` corners, used to bin
+        obstacles into the traversal grid.
+
+        A two-dimensional course returns normals whose third component is
+        zero and bounds whose z range spans the whole course, which embeds
+        its obstacles as prisms and lets the shared kernel treat them as
+        solids without special casing.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------ #
+    # Spatial index
+    # ------------------------------------------------------------------ #
+    def _visibility_index(self):
+        """Build, or reuse, the uniform grid the segment walk steps through."""
+        normals, offsets, facet_indptr, bounds = self.half_spaces()
+
+        token = (id(normals), id(offsets), len(offsets), len(bounds))
+        cached = getattr(self, "_visibility_cache", None)
+
+        if cached is not None and cached[0] == token:
+            return cached[1]
+
+        count = len(bounds)
+
+        if count:
+            extents = bounds[:, 3:] - bounds[:, :3]
+            # The z extent of an embedded 2D course spans the whole domain and
+            # would swamp the mean, so only positive finite spans in each axis
+            # contribute.
+            typical = np.median(extents[extents > 0.0]) if np.any(extents > 0.0) else 1.0
+            cell = max(float(typical) * self._CELL_FACTOR, 1e-9)
+            origin = bounds[:, :3].min(axis=0)
+            far = bounds[:, 3:].max(axis=0)
+        else:
+            cell = 1.0
+            origin = np.zeros(3)
+            far = np.ones(3)
+
+        shape = np.maximum(
+            np.ceil((far - origin) / cell).astype(np.int64), 1
+        )
+
+        # Cap the lattice so a course with one very small obstacle and one
+        # very large one cannot ask for an unbounded number of cells.
+        while int(shape[0]) * int(shape[1]) * int(shape[2]) > 8_000_000:
+            cell *= 2.0
+            shape = np.maximum(
+                np.ceil((far - origin) / cell).astype(np.int64), 1
+            )
+
+        grid_indptr, grid_items = _bin_obstacles(bounds, origin, cell, shape)
+
+        index = (
+            np.ascontiguousarray(normals, dtype=float),
+            np.ascontiguousarray(offsets, dtype=float),
+            np.ascontiguousarray(facet_indptr, dtype=np.int64),
+            grid_indptr,
+            grid_items,
+            np.ascontiguousarray(origin, dtype=float),
+            float(cell),
+            np.ascontiguousarray(shape, dtype=np.int64),
+        )
+
+        self._visibility_cache = (token, index)
+
+        return index
+
+    @staticmethod
+    def _embed(points, dimension: int) -> np.ndarray:
+        """Lift ``(n, d)`` coordinates into the kernel's three columns."""
+        points = np.atleast_2d(np.asarray(points, dtype=float))
+
+        if points.shape[1] == 3:
+            return np.ascontiguousarray(points)
+
+        lifted = np.zeros((len(points), 3), dtype=float)
+        lifted[:, :points.shape[1]] = points[:, :dimension]
+
+        return lifted
+
+    # ------------------------------------------------------------------ #
+    # Queries
+    # ------------------------------------------------------------------ #
+    def is_visible(self, vertex1, vertex2, tol: float = 1e-9):
+        """Are the segments ``vertex1[k] -> vertex2[k]`` free of every obstacle?
+
+        Accepts a single pair of points or two ``(n, d)`` arrays, and returns
+        a ``bool`` or an ``(n,)`` array to match. A segment that runs along an
+        obstacle boundary is visible; one that enters an obstacle's interior
+        is not.
+        """
+        start = np.asarray(vertex1, dtype=float)
+        end = np.asarray(vertex2, dtype=float)
+
+        scalar = start.ndim == 1 and end.ndim == 1
+
+        start = np.atleast_2d(start)
+        end = np.atleast_2d(end)
+        start, end = np.broadcast_arrays(start, end)
+
+        if len(start) == 0:
+            return np.zeros(0, dtype=bool)
+
+        index = self._visibility_index()
+
+        visible = _visible_paired(
+            self._embed(start, self.dimension),
+            self._embed(end, self.dimension),
+            *index,
+            float(tol),
+        )
+
+        return bool(visible[0]) if scalar else visible
+
+    def contains_points(self, points, tol: float = 0.0) -> np.ndarray:
+        """``(n,)`` bool: does each point lie inside some obstacle?
+
+        ``tol`` shifts every face outwards, so a negative value excludes
+        points sitting exactly on an obstacle boundary and a positive one
+        counts points just outside as inside.
+
+        Routed through the traversal grid rather than evaluated as a dense
+        ``(n_points, n_facets)`` product. That product is quadratic in the
+        course: at fifteen thousand obstacles it is a 22 GiB array, and the
+        expression that built it needed two of them at once. The grid gives
+        the same answer at a cost that grows linearly.
+        """
+        points = np.atleast_2d(np.asarray(points, dtype=float))
+
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool)
+
+        normals, offsets, _, _ = self.half_spaces()
+
+        if len(offsets) == 0:
+            return np.zeros(len(points), dtype=bool)
+
+        return _points_inside(
+            self._embed(points, self.dimension),
+            *self._visibility_index(),
+            float(tol),
+        )
+
+    def visible_pairs(self, points, chunk: int = 4_000_000, tol: float = 1e-9):
+        """Index arrays ``(i, j)``, ``i < j``, of every mutually visible pair.
+
+        The pair count grows as ``n**2``, so the upper triangle is walked a
+        row-block at a time and the block is reduced to indices before the
+        next one is built. Nothing proportional to ``n**2`` is ever held.
+        """
         points = np.asarray(points, dtype=float)
         count = len(points)
 
@@ -131,70 +640,187 @@ class VisibilityMixin:
             empty = np.zeros(0, dtype=np.int64)
             return empty, empty.copy()
 
-        first, second = [], []
+        embedded = self._embed(points, self.dimension)
+        index = self._visibility_index()
 
-        # Walk the upper triangle a row-block at a time so the index arrays
-        # never exist in full.
         rows_per_chunk = max(1, chunk // max(count, 1))
+        first, second = [], []
 
         for low in range(0, count - 1, rows_per_chunk):
             high = min(low + rows_per_chunk, count - 1)
 
-            rows = np.arange(low, high)
-            widths = count - rows - 1
-
-            row_index = np.repeat(rows, widths)
-            column_index = (
-                np.arange(len(row_index))
-                - np.repeat(np.concatenate([[0], np.cumsum(widths)[:-1]]), widths)
-                + row_index
-                + 1
+            block = _visible_block(
+                embedded,
+                low,
+                high,
+                *index,
+                float(tol),
             )
 
-            visible = np.asarray(
-                self.is_visible(points[row_index], points[column_index])
-            )
-
-            first.append(row_index[visible])
-            second.append(column_index[visible])
+            rows, columns = np.nonzero(block)
+            first.append(rows.astype(np.int64) + low)
+            second.append(columns.astype(np.int64))
 
         return np.concatenate(first), np.concatenate(second)
 
 
+@njit(cache=True, nogil=True)
+def _bin_obstacles(bounds, origin, cell, shape):
+    """CSR map from grid cell to the obstacles whose box touches it.
+
+    Binning by bounding box is what makes the traversal sound: if a segment
+    penetrates an obstacle, the penetration point lies inside that obstacle's
+    box, the walk visits the cell containing that point, and the obstacle is
+    listed there.
+    """
+    count = bounds.shape[0]
+    cells_x = shape[0]
+    cells_y = shape[1]
+    cells_z = shape[2]
+    total = cells_x * cells_y * cells_z
+
+    counts = np.zeros(total + 1, dtype=np.int64)
+
+    # Two passes: count occupancy, then fill. One pass would need a growable
+    # per-cell list, which is far slower under numba than walking twice.
+    for pass_index in range(2):
+        if pass_index == 1:
+            indptr = np.zeros(total + 1, dtype=np.int64)
+            for cell_index in range(total):
+                indptr[cell_index + 1] = indptr[cell_index] + counts[cell_index + 1]
+
+            items = np.empty(indptr[total], dtype=np.int64)
+            cursor = indptr[:total].copy()
+
+        for obstacle in range(count):
+            low_x = int(np.floor((bounds[obstacle, 0] - origin[0]) / cell))
+            low_y = int(np.floor((bounds[obstacle, 1] - origin[1]) / cell))
+            low_z = int(np.floor((bounds[obstacle, 2] - origin[2]) / cell))
+            high_x = int(np.floor((bounds[obstacle, 3] - origin[0]) / cell))
+            high_y = int(np.floor((bounds[obstacle, 4] - origin[1]) / cell))
+            high_z = int(np.floor((bounds[obstacle, 5] - origin[2]) / cell))
+
+            if low_x < 0:
+                low_x = 0
+            if low_y < 0:
+                low_y = 0
+            if low_z < 0:
+                low_z = 0
+            if high_x > cells_x - 1:
+                high_x = cells_x - 1
+            if high_y > cells_y - 1:
+                high_y = cells_y - 1
+            if high_z > cells_z - 1:
+                high_z = cells_z - 1
+
+            for index_x in range(low_x, high_x + 1):
+                for index_y in range(low_y, high_y + 1):
+                    for index_z in range(low_z, high_z + 1):
+                        cell_index = (
+                            index_x * cells_y + index_y
+                        ) * cells_z + index_z
+
+                        if pass_index == 0:
+                            counts[cell_index + 1] += 1
+                        else:
+                            items[cursor[cell_index]] = obstacle
+                            cursor[cell_index] += 1
+
+    return indptr, items
+
+
 @define
 class ObstacleCourse(VisibilityMixin):
+    """A rectangular 2D course holding convex polygonal obstacles.
+
+    Each obstacle is an ``(n, 2)`` array of corners in order, convex and
+    without a repeated closing point. Convexity is a precondition rather
+    than something enforced by repair: it is what lets the shared visibility
+    kernel reduce an obstacle to its faces, and a non-convex obstacle passed
+    here would be silently mis-tested. ``ObstacleCourse.random`` draws convex
+    obstacles by construction; a caller supplying its own must decompose any
+    non-convex body into convex pieces first.
+    """
+
     width: float = field(default=25.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
     height: float = field(default=25.0, converter=float, validator=[validators.instance_of(float), validators.gt(0)])
-    obstacles: list[Polygon] = field(factory=list)
+    obstacles: list = field(factory=list)
 
-    obstacles_region = field(init=False)
-    obstacles_region_eroded = field(init=False)
+    facet_normals = field(init=False)
+    facet_offsets = field(init=False)
+    facet_indptr = field(init=False)
+    obstacle_bounds = field(init=False)
 
     def __attrs_post_init__(self):
-        self.obstacles_region = shapely.union_all(self.obstacles)
-        shapely.prepare(self.obstacles_region)
+        self.obstacles = [
+            np.ascontiguousarray(np.asarray(obstacle, dtype=float)[:, :2])
+            for obstacle in (self.obstacles or [])
+            if obstacle is not None and len(np.asarray(obstacle)) >= 3
+        ]
 
-        # `is_visible` has to separate a segment that passes through an
-        # obstacle from one that merely runs along its boundary, which a
-        # minimum-pressure path is allowed to do. Asking GEOS that question
-        # directly, with `touches`, costs a full DE-9IM relate against the
-        # whole multipolygon: ~35x a `disjoint` call, and it dominates the
-        # visibility graph at every course size.
-        #
-        # Shrinking the region by a hair answers it with `disjoint` alone.
-        # A segment grazing the boundary misses the eroded set entirely,
-        # while one crossing the interior still cuts a chord through it,
-        # so the two cases separate without the relate.
-        #
-        # The offset is scaled to the course so it stays far above double
-        # precision at the coordinate magnitudes in play, and far below any
-        # feature size: an obstacle would have to be ~1e-9 of the course
-        # across before erosion could erase it.
-        self.obstacles_region_eroded = shapely.buffer(
-            self.obstacles_region,
-            -_EROSION_FRACTION * min(self.width, self.height),
+        for index, obstacle in enumerate(self.obstacles, start=1):
+            if not polygon_is_convex(obstacle):
+                raise ValueError(
+                    f"obstacle {index} is not convex. The visibility kernel "
+                    "reduces each obstacle to its faces, which is only sound "
+                    "for a convex body; decompose it into convex pieces first."
+                )
+
+        self._build_half_spaces()
+
+    def _build_half_spaces(self) -> None:
+        """Cache the face representation the visibility kernel reads.
+
+        Built once here rather than per query: the faces depend only on the
+        obstacles, and rebuilding them for every segment was most of what the
+        old geometry library was doing.
+
+        The third column of every normal is zero and the z bounds span a unit
+        slab about zero, which extrudes each polygon into a prism. Query
+        points are embedded at ``z = 0``, so the extrusion never affects an
+        answer -- it exists only so the 2D and 3D courses can share one
+        compiled kernel.
+        """
+        normals, offsets, indptr, bounds = [], [], [0], []
+
+        for obstacle in self.obstacles:
+            plane_normals, plane_offsets = polygon_half_spaces(obstacle)
+
+            padded = np.zeros((len(plane_offsets), 3), dtype=float)
+            padded[:, :2] = plane_normals
+
+            normals.append(padded)
+            offsets.append(plane_offsets)
+            indptr.append(indptr[-1] + len(plane_offsets))
+
+            bounds.append((
+                obstacle[:, 0].min(),
+                obstacle[:, 1].min(),
+                -0.5,
+                obstacle[:, 0].max(),
+                obstacle[:, 1].max(),
+                0.5,
+            ))
+
+        self.facet_normals = (
+            np.vstack(normals) if normals else np.zeros((0, 3))
         )
-        shapely.prepare(self.obstacles_region_eroded)
+        self.facet_offsets = (
+            np.concatenate(offsets) if offsets else np.zeros(0)
+        )
+        self.facet_indptr = np.asarray(indptr, dtype=np.int64)
+        self.obstacle_bounds = (
+            np.asarray(bounds, dtype=float) if bounds else np.zeros((0, 6))
+        )
+
+    def half_spaces(self):
+        """See ``VisibilityMixin.half_spaces``."""
+        return (
+            self.facet_normals,
+            self.facet_offsets,
+            self.facet_indptr,
+            self.obstacle_bounds,
+        )
 
     @property
     def dimension(self) -> int:
@@ -214,38 +840,30 @@ class ObstacleCourse(VisibilityMixin):
         if start is not None and end is not None:
             return np.asarray(start, dtype=float), np.asarray(end, dtype=float)
 
-        course_region = shapely.box(0.0, 0.0, self.width, self.height)
+        # The farthest separated pair of points in the free region is
+        # attained on the boundary of its convex hull, and the hull of the
+        # free region is the course rectangle itself unless an obstacle eats
+        # a whole corner. Testing the four corners and falling back to
+        # obstacle vertices covers both cases without constructing the free
+        # region as a set.
+        corners = np.array([
+            (0.0, 0.0),
+            (self.width, 0.0),
+            (self.width, self.height),
+            (0.0, self.height),
+        ], dtype=float)
 
-        if self.obstacles:
-            valid_region = shapely.difference(
-                course_region,
-                self.obstacles_region,
+        candidates = corners[~self.contains_points(corners)]
+
+        if len(candidates) < 2:
+            # Corners are covered; fall back to the obstacle corners, which
+            # are the remaining extreme points of the free region.
+            fallback = self.vertices()
+            candidates = (
+                np.vstack((candidates, fallback))
+                if len(candidates)
+                else fallback
             )
-        else:
-            valid_region = course_region
-
-        if valid_region.is_empty or valid_region.area <= 0:
-            raise RuntimeError(
-                "The obstacle course has no valid area for start "
-                "and end points."
-            )
-
-        # The farthest pair of points in a polygonal region can be found
-        # among the vertices of its convex hull.
-        convex_hull = valid_region.convex_hull
-
-        if convex_hull.geom_type != "Polygon":
-            raise RuntimeError(
-                "The valid region does not contain enough area to "
-                "generate distinct start and end points."
-            )
-
-        # The final exterior coordinate repeats the first coordinate,
-        # so remove it.
-        candidates = np.asarray(
-            convex_hull.exterior.coords,
-            dtype=float,
-        )[:-1, :2]
 
         if len(candidates) < 2:
             raise RuntimeError(
@@ -283,16 +901,16 @@ class ObstacleCourse(VisibilityMixin):
         Ff the point is in the obstacle course and the point
         is not inside any obstacles then it is a valid goal.
         """
-        point = shapely.Point(
-            float(coords[0]),
-            float(coords[1]),
-        )
         return (
-            # Check if it's inside to obstacle course
+            # Inside the course rectangle,
             0 <= coords[0] <= self.width
             and 0 <= coords[1] <= self.height
-            # Check if the point is inside any obstacles
-            and not self.obstacles_region.contains(point)
+            # and not inside any obstacle. Boundary contact is allowed: a
+            # path may start against an obstacle, just not within one.
+            and not bool(self.contains_points(
+                np.asarray(coords, dtype=float)[None, :2],
+                tol=-1e-12,
+            )[0])
         )
 
 
@@ -493,8 +1111,8 @@ class ObstacleCourse(VisibilityMixin):
                 stacklevel=2,
             )
 
-        course_region = shapely.box(0.0, 0.0, width, height)
-        center_region = shapely.box(
+        course_bounds = (0.0, 0.0, width, height)
+        center_bounds = (
             inset_low_x,
             inset_low_y,
             inset_high_x,
@@ -532,8 +1150,8 @@ class ObstacleCourse(VisibilityMixin):
                 min_radius,
                 max_radius,
                 polygons,
-                course_region,
-                center_region,
+                course_bounds,
+                center_bounds,
             )
             report_shortfall()
             return cls(width=width, height=height, obstacles=polygons)
@@ -563,32 +1181,23 @@ class ObstacleCourse(VisibilityMixin):
                     height,
                 ),
             ):
-                free_corner = shapely.difference(
-                    shapely.box(low_x, low_y, high_x, high_y),
-                    course.obstacles_region,
-                )
+                # Uniform over the corner box with occupied draws discarded
+                # is uniform over the free part of it, which is the same
+                # distribution a triangulation of that free part would give
+                # and costs one containment test per draw instead.
+                for _ in range(4096):
+                    candidate = np.array([
+                        rng.uniform(low_x, high_x),
+                        rng.uniform(low_y, high_y),
+                    ])
 
-                if (
-                    free_corner.is_empty
-                    or free_corner.area <= 0.0
-                    or free_corner.geom_type
-                    not in ("Polygon", "MultiPolygon")
-                ):
-                    raise RuntimeError(
-                        "No free space is left in the corner a random goal "
-                        "is drawn from. Reduce num_obstacles or radius."
-                    )
-
-                # One triangulation covers every attempt, so the retry costs
-                # nothing beyond the validity test itself.
-                for candidate in sample_uniform_points(free_corner, 64, rng):
                     if course.valid_goal(candidate):
-                        goals.append(np.asarray(candidate, dtype=float))
+                        goals.append(candidate)
                         break
                 else:
                     raise RuntimeError(
                         "Could not draw a valid goal from a corner of the "
-                        "course."
+                        "course. Reduce num_obstacles or radius."
                     )
 
             return goals
@@ -646,7 +1255,7 @@ class ObstacleCourse(VisibilityMixin):
                     min_radius,
                     max_radius,
                     polygons,
-                    course_region,
+                    course_bounds,
                     spanning_axis=spanning_axis,
                     raise_on_failure=False,
                 )
@@ -690,7 +1299,7 @@ class ObstacleCourse(VisibilityMixin):
         # visibility graph.
         corner_offset = corner_offset_fraction * min_radius
 
-        outside_region = shapely.box(
+        outside_bounds = (
             -2.0 * max_radius,
             -2.0 * max_radius,
             width + 2.0 * max_radius,
@@ -711,9 +1320,9 @@ class ObstacleCourse(VisibilityMixin):
                 min_radius,
                 max_radius,
                 polygons,
-                course_region,
+                course_bounds,
                 spanning_axis=outward,
-                containment_region=outside_region,
+                containment_bounds=outside_bounds,
                 raise_on_failure=False,
             )
 
@@ -748,8 +1357,8 @@ class ObstacleCourse(VisibilityMixin):
         # obstacles' own vertex tuples.
         planner_coords = simplified_planner.coords
 
-        obstacle_a_vertices = set(anchors[0].exterior.coords[:-1])
-        obstacle_b_vertices = set(anchors[1].exterior.coords[:-1])
+        obstacle_a_vertices = {tuple(vertex) for vertex in anchors[0]}
+        obstacle_b_vertices = {tuple(vertex) for vertex in anchors[1]}
 
         # Paths arrive in nondecreasing total visibility-graph length, so
         # the first usable one is the shortest path. After fixing its
@@ -943,7 +1552,7 @@ class ObstacleCourse(VisibilityMixin):
                     min_radius,
                     max_radius,
                     polygons,
-                    course_region,
+                    course_bounds,
                     forbidden_points=line_centers[center_index + 1:],
                     max_attempts=800,
                     raise_on_failure=False,
@@ -972,8 +1581,8 @@ class ObstacleCourse(VisibilityMixin):
             min_radius,
             max_radius,
             polygons,
-            course_region,
-            center_region,
+            course_bounds,
+            center_bounds,
         )
 
         report_shortfall()
@@ -1001,80 +1610,26 @@ class ObstacleCourse(VisibilityMixin):
         index vertices by integer; the array itself is the index-to-coordinate
         map.
         """
-        points = list(
-            itertools.chain.from_iterable(
-                map(
-                    lambda obstacle: obstacle.exterior.coords[:-1],
-                    self.obstacles,
-                )
-            )
-        )
-
-        if not points:
+        if not self.obstacles:
             return np.zeros((0, 2), dtype=float)
 
-        points = np.asarray(points, dtype=float)[:, :2]
+        points = np.vstack(self.obstacles)
 
         x = points[:, 0]
         y = points[:, 1]
 
-        # One batched call each, rather than a predicate per corner.
+        # A corner strictly inside another obstacle is buried and cannot be
+        # turned around; one merely touching an obstacle boundary can, so the
+        # containment test excludes its own boundary.
         keep = (
             (x >= 0.0)
             & (x <= self.width)
             & (y >= 0.0)
             & (y <= self.height)
-            & ~shapely.contains_xy(self.obstacles_region, x, y)
+            & ~self.contains_points(points, tol=-1e-12)
         )
 
         return points[keep]
-
-    def is_visible(self, vertex1, vertex2):
-        """Are the segments ``vertex1[k] -> vertex2[k]`` free of every obstacle?
-
-        Accepts a single pair of points or two ``(n, 2)`` arrays, and returns a
-        ``bool`` or an ``(n,)`` array to match.
-
-        Shapely 2's predicates are numpy ufuncs that broadcast one geometry
-        against an array of them, so the whole batch crosses into GEOS in a
-        single call. ``shapely.prepare`` was applied to the eroded obstacle
-        region at construction, which builds its index once instead of per
-        query.
-
-        A segment running along an obstacle boundary stays visible, which is
-        what lets a minimum-pressure path hug a wall. That case is separated
-        from a segment cutting through an obstacle by the erosion rather than
-        by a ``touches`` call; see ``__attrs_post_init__``.
-        """
-        start = np.asarray(vertex1, dtype=float)
-        end = np.asarray(vertex2, dtype=float)
-
-        scalar = start.ndim == 1 and end.ndim == 1
-
-        start = np.atleast_2d(start)
-        end = np.atleast_2d(end)
-        start, end = np.broadcast_arrays(start, end)
-
-        if len(start) == 0:
-            return np.zeros(0, dtype=bool)
-
-        # One C call builds every segment, rather than one Python object at a
-        # time.
-        coordinates = np.empty((2 * len(start), 2), dtype=float)
-        coordinates[0::2] = start
-        coordinates[1::2] = end
-
-        lines = shapely.linestrings(
-            coordinates,
-            indices=np.repeat(np.arange(len(start)), 2),
-        )
-
-        # Missing the eroded region keeps a path that runs along an obstacle
-        # boundary legal, which is what a minimum-pressure path wants to do,
-        # and costs one cheap predicate instead of `disjoint | touches`.
-        visible = shapely.disjoint(self.obstacles_region_eroded, lines)
-
-        return bool(visible[0]) if scalar else visible
 
     def plot(
         self,
@@ -1091,26 +1646,35 @@ class ObstacleCourse(VisibilityMixin):
             fig = ax.figure
 
         for index, obstacle in enumerate(self.obstacles or [], start=1):
-            if obstacle is None or obstacle.is_empty:
+            if obstacle is None or len(obstacle) < 3:
                 continue
 
-            plot_polygon(
+            ax.add_patch(MatplotlibPolygon(
                 obstacle,
-                ax=ax,
-                add_points=show_vertices,
+                closed=True,
                 facecolor="tab:blue",
                 edgecolor="black",
                 linewidth=1.5,
                 alpha=0.4,
-            )
+            ))
+
+            if show_vertices:
+                ax.plot(
+                    obstacle[:, 0],
+                    obstacle[:, 1],
+                    linestyle="none",
+                    marker="o",
+                    markersize=3,
+                    color="tab:blue",
+                )
 
             if show_labels:
-                # Unlike the centroid, representative_point() is guaranteed
-                # to lie within the polygon.
-                label_point = obstacle.representative_point()
+                # The centroid of a convex polygon is inside it, so it is a
+                # safe place to put the label.
+                label_point = obstacle.mean(axis=0)
                 ax.text(
-                    label_point.x,
-                    label_point.y,
+                    label_point[0],
+                    label_point[1],
                     str(index),
                     horizontalalignment="center",
                     verticalalignment="center",
@@ -1245,7 +1809,7 @@ class ObstacleCourse(VisibilityMixin):
             if path is None:
                 continue
 
-            path_coords = np.asarray(path.coords, dtype=float)
+            path_coords = np.asarray(path, dtype=float)
             path_length, path_angle_radians = path_metrics(path)
 
             # The recursive model depends on where each bend sits along
@@ -1358,7 +1922,6 @@ class ObstacleCourse(VisibilityMixin):
 
 _FACE_AXIS = (0, 1, 0, 1, 2, 2)
 _FACE_SIGN = (1, 1, -1, -1, -1, 1)
-_FACE_NAMES = ("+x", "+y", "-x", "-y", "-z", "+z")
 
 # Face code of the negative / positive face of a voxel, indexed by axis.
 _NEGATIVE_FACE = (2, 3, 4)      # -x, -y, -z
@@ -1390,6 +1953,11 @@ class ObstacleCourseVoxels(VisibilityMixin):
     discretization: object | None = field(default=None)
 
     obstacles: list[tuple[int, int, int, int]] = field(factory=list)
+
+    facet_normals = field(init=False, default=None)
+    facet_offsets = field(init=False, default=None)
+    facet_indptr = field(init=False, default=None)
+    obstacle_bounds = field(init=False, default=None)
 
     # Solid model, built once: (n, 3) lower and upper corners of every wall.
     box_low: np.ndarray = field(init=False, default=None)
@@ -1460,6 +2028,52 @@ class ObstacleCourseVoxels(VisibilityMixin):
             if bounds else np.zeros((0, 3))
         )
 
+        self._build_half_spaces()
+
+    def _build_half_spaces(self) -> None:
+        """Cache the face representation the visibility kernel reads.
+
+        An axis-aligned box is six half-spaces, ``x_a <= high_a`` and
+        ``-x_a <= -low_a`` for each axis, whose normals are the signed unit
+        axes and whose offsets follow directly from the corners. There is
+        nothing to compute: the box corners already are the face data, in a
+        different arrangement.
+        """
+        count = len(self.box_low)
+
+        if count == 0:
+            self.facet_normals = np.zeros((0, 3))
+            self.facet_offsets = np.zeros(0)
+            self.facet_indptr = np.zeros(1, dtype=np.int64)
+            self.obstacle_bounds = np.zeros((0, 6))
+            return
+
+        # Six rows per box: +x, +y, +z then -x, -y, -z.
+        normals = np.tile(
+            np.vstack((np.eye(3), -np.eye(3))),
+            (count, 1),
+        )
+
+        offsets = np.empty((count, 6), dtype=float)
+        offsets[:, :3] = -self.box_high
+        offsets[:, 3:] = self.box_low
+
+        self.facet_normals = np.ascontiguousarray(normals)
+        self.facet_offsets = np.ascontiguousarray(offsets.reshape(-1))
+        self.facet_indptr = np.arange(count + 1, dtype=np.int64) * 6
+        self.obstacle_bounds = np.ascontiguousarray(
+            np.hstack((self.box_low, self.box_high))
+        )
+
+    def half_spaces(self):
+        """See ``VisibilityMixin.half_spaces``."""
+        return (
+            self.facet_normals,
+            self.facet_offsets,
+            self.facet_indptr,
+            self.obstacle_bounds,
+        )
+
     # ------------------------------------------------------------------ #
     # Solid model
     # ------------------------------------------------------------------ #
@@ -1513,10 +2127,12 @@ class ObstacleCourseVoxels(VisibilityMixin):
         if len(self.box_low) == 0:
             return np.zeros(len(points), dtype=bool)
 
-        return (
-            np.all(points[:, None, :] > self.box_low[None] + tol, axis=2)
-            & np.all(points[:, None, :] < self.box_high[None] - tol, axis=2)
-        ).any(axis=1)
+        # Strictly inside by a margin of ``tol`` is the half-space condition
+        # ``a . x + b <= -tol``, so this is `contains_points` with the face
+        # offset reversed. Sharing the grid-backed kernel keeps the cost
+        # linear in the wall count instead of building an
+        # ``(n_points, n_walls, 3)`` array.
+        return self.contains_points(points, tol=-abs(tol))
 
     # ------------------------------------------------------------------ #
     # Planner interface
@@ -1688,111 +2304,6 @@ class ObstacleCourseVoxels(VisibilityMixin):
         self._vertices = points[inside_course & ~self.inside_walls(points)]
         return self._vertices
 
-    def is_visible(self, vertex1, vertex2, tol: float = 1e-9):
-        """Are the segments ``vertex1[k] -> vertex2[k]`` free of every wall?
-
-        Accepts a single pair of points or two ``(n, 3)`` arrays, and returns a
-        ``bool`` or an ``(n,)`` array to match.
-
-        Each box is clipped independently, which the dilation makes sound (see
-        the note at the top of the file). Writing the segment as
-        ``x(t) = p + t (q - p)`` and the box as ``lo <= x <= hi``, the six face
-        distances are ``x - hi`` and ``lo - x``, each affine in ``t``, so
-        ``g(t) = max`` over the six is convex and piecewise linear. Clipping
-        gives ``[t0, t1]``, the whole of the segment meeting the closed box,
-        and ``g`` vanishes at both ends of it. Convexity then leaves exactly
-        two possibilities: ``g`` is identically zero across the interval,
-        meaning the segment only skims the surface, or strictly negative
-        throughout, meaning it passes through. Probing the middle separates
-        them, so one evaluation per box decides it. A skim stays visible on
-        purpose: a path is allowed to hug a wall.
-
-        The loop runs over *boxes* while vectorising over *segments*, rather
-        than building one ``(segments, boxes, 3)`` array. That array is far
-        larger than cache at any useful size and the memory traffic costs more
-        than the arithmetic saves; keeping it ``(segments, 3)`` also lets each
-        box narrow the surviving set for the next one.
-        """
-        start = np.asarray(vertex1, dtype=float)
-        end = np.asarray(vertex2, dtype=float)
-
-        scalar = start.ndim == 1 and end.ndim == 1
-
-        start = np.atleast_2d(start)
-        end = np.atleast_2d(end)
-        start, end = np.broadcast_arrays(start, end)
-
-        visible = np.ones(len(start), dtype=bool)
-
-        if len(start) == 0 or len(self.box_low) == 0:
-            return bool(visible[0]) if scalar else visible
-
-        direction = end - start
-
-        # Degenerate segments touch nothing.
-        visible &= np.einsum("ij,ij->i", direction, direction) > 1e-24
-
-        segment_low = np.minimum(start, end)
-        segment_high = np.maximum(start, end)
-
-        # Largest walls first: they eliminate the most segments, and every
-        # later box then works on a smaller surviving set.
-        order = np.argsort(-np.prod(self.box_high - self.box_low, axis=1))
-
-        for box in order:
-            low, high = self.box_low[box], self.box_high[box]
-
-            alive = np.flatnonzero(visible)
-            if alive.size == 0:
-                break
-
-            # Broad phase: an axis-aligned overlap test rejects most segments
-            # for the cost of six comparisons.
-            near = alive[
-                np.all(segment_high[alive] >= low, axis=1)
-                & np.all(segment_low[alive] <= high, axis=1)
-            ]
-            if near.size == 0:
-                continue
-
-            origin = start[near]
-            step = direction[near]
-
-            parallel = np.abs(step) <= 1e-12
-            safe = np.where(parallel, 1.0, step)
-
-            lower = (low - origin) / safe
-            upper = (high - origin) / safe
-
-            entering = np.minimum(lower, upper)
-            exiting = np.maximum(lower, upper)
-
-            outside = parallel & ((origin < low) | (origin > high))
-            entering = np.where(parallel, np.where(outside, np.inf, 0.0), entering)
-            exiting = np.where(parallel, np.where(outside, -np.inf, 1.0), exiting)
-
-            first = np.maximum(entering.max(axis=1), 0.0)
-            last = np.minimum(exiting.min(axis=1), 1.0)
-
-            touched = np.flatnonzero(first <= last)
-            if touched.size == 0:
-                continue
-
-            # Probe the middle of the contact interval. The depth is a real
-            # distance, so `tol` keeps its geometric meaning.
-            middle = (
-                origin[touched]
-                + (0.5 * (first[touched] + last[touched]))[:, None] * step[touched]
-            )
-            depth = np.maximum(middle - high, low - middle).max(axis=1)
-
-            visible[near[touched[depth < -0.5 * tol]]] = False
-
-        return bool(visible[0]) if scalar else visible
-
-    # ------------------------------------------------------------------ #
-    # Lattice geometry
-    # ------------------------------------------------------------------ #
     @property
     def shape(self) -> tuple[int, int, int]:
         """Number of voxels along x, y and z."""
@@ -2407,7 +2918,7 @@ class ObstacleCourseVoxels(VisibilityMixin):
             if path is None:
                 continue
 
-            coordinates = np.asarray(path.coords, dtype=float)
+            coordinates = np.asarray(path, dtype=float)
 
             # MultipleLines needs at least two points; a degenerate path would
             # otherwise raise inside VTK.

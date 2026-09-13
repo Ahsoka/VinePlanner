@@ -1,10 +1,10 @@
 import numpy as np
 import itertools
-import shapely
+
+from numba import njit
 
 from functools import lru_cache
 
-from shapely import Polygon, LineString, Point
 from .constants import (
     YIELD_PRESSURE_PSI,
     LENGTH_FRICTION_PSI_PER_FT,
@@ -19,19 +19,32 @@ from .constants import (
 # Pressure model
 # ------------------------------------------------------------------
 #
-# Recursive (nested capstan) growth pressure. For a path of n segments
-# with lengths l_1 ... l_n and n - 1 interior turning angles t_1 ... t_{n-1}:
+# Recursive (nested capstan) growth pressure. Writing the paper's symbols
+# for a path of n segments with lengths l_1 ... l_n and n - 1 interior
+# turning angles theta_1 ... theta_{n-1}:
 #
 #     tau_0 = T
-#     tau_i = (tau_{i-1} + f * l_i) * exp(mu_c * |t_i|)      i = 1 ... n-1
-#     P     = Y + tau_{n-1} + f * l_n
+#     tau_i = (tau_{i-1} + lambda * l_i) * exp(mu * |theta_i|)   i = 1 ... n-1
+#     P     = Y + tau_{n-1} + lambda * l_n
+#
+# where P is the growth pressure, Y the yield pressure required to evert
+# the vine, lambda the length dependent friction term between the inside
+# of the body and the tail, T the tension in the tail from the tug of the
+# reel, and mu the Capstan friction coefficient for a bend. Dividing the
+# governing equation
+#
+#     P A = Y A + lambda L + T exp(mu theta)
+#
+# through by the cross sectional area A is what puts lambda and T in
+# pressure units, which is how they are carried here; see
+# `vine_robot_pressure`.
 #
 # Each segment's drag is amplified only by the bends *distal* to it, i.e.
 # the bends its accumulated tension must still be dragged through on the
 # way to the tip. The terminal segment has nothing distal to it and is
 # therefore charged at face value.
 #
-# This replaces the summed form P = Y + (f * L + T) * exp(mu_c * sum|t_i|),
+# This replaces the summed form P = Y + (lambda L + T) exp(mu sum|theta_i|),
 # which charges every segment for every bend and is a strict upper bound.
 # ------------------------------------------------------------------
 
@@ -69,15 +82,12 @@ def _length_scale(length_units: str) -> float:
 def segment_geometry(path) -> tuple[np.ndarray, np.ndarray]:
     """Return per-segment lengths and per-vertex turning angles.
 
-    Accepts a ``LineString`` or any ``(n + 1, d)`` array of vertices, in
+    Accepts any ``(n + 1, d)`` array of vertices, in
     two or three dimensions. Consecutive duplicate vertices are dropped.
     Turning angles are unsigned and reported in radians; there is one
     per interior vertex, so ``len(angles) == len(lengths) - 1``.
     """
-    coords = np.asarray(
-        path.coords if hasattr(path, "coords") else path,
-        dtype=float,
-    )
+    coords = np.asarray(path, dtype=float)
 
     if coords.ndim != 2 or len(coords) < 2:
         return np.zeros(0), np.zeros(0)
@@ -186,8 +196,25 @@ def vine_robot_pressure(
     angle_units:
         Units used for ``angles``: ``"degrees"`` or ``"radians"``.
     yield_pressure, length_friction, tail_tension, curvature_coefficient:
-        Model parameters, defaulting to the fitted values in
-        ``constants``. ``length_friction`` is psi per foot regardless of
+        The model parameters ``Y``, ``lambda``, ``T`` and ``mu`` of the
+        governing equation
+
+            P A = Y A + lambda L + T exp(mu theta),
+
+        where ``P`` is the growth pressure, ``A`` the cross sectional area
+        of the vine robot, ``Y`` the yield pressure required to evert the
+        vine, ``lambda`` a length dependent friction term accounting for
+        the friction between the inside of the body and the tail in
+        straight sections, ``L`` the total length of the robot, ``T`` the
+        tension in the tail caused by the tug of the reel, ``mu`` the
+        Capstan friction coefficient for the friction between the tail and
+        the inside of the body in a bend, and ``theta`` in ``[0, pi]`` the
+        angle of the turn in radians.
+
+        Divided through by ``A``, both ``lambda`` and ``T`` carry pressure
+        units, which is how they are taken here. They default to the
+        fitted values in ``constants``. ``length_friction`` is psi per foot
+        regardless of
         ``length_units``.
 
     Returns
@@ -233,7 +260,7 @@ def vine_robot_pressure(
     drag = length_friction * lengths_ft
     amplification = np.exp(curvature_coefficient * turning_angles)
 
-    # tau_i = (tau_{i-1} + f * l_i) * exp(mu_c * |t_i|), then the
+    # tau_i = (tau_{i-1} + lambda * l_i) * exp(mu * |theta_i|), then the
     # terminal segment is added without amplification.
     tension = float(tail_tension)
 
@@ -251,7 +278,7 @@ def path_pressure(
     length_units: str = "ft",
     **model_parameters,
 ) -> float:
-    """Growth pressure of a ``LineString`` or vertex array, in psi."""
+    """Growth pressure of an ``(n + 1, d)`` vertex array, in psi."""
     lengths, angles = segment_geometry(path)
 
     if lengths.size == 0:
@@ -523,7 +550,7 @@ def suggested_radius(
     min_vertices: int,
     max_vertices: int,
     annulus_offset: float,
-    packing_coefficient: float = 0.65,
+    packing_coefficient: float = 0.6,
     margin: float = 1.25,
 ) -> float:
     """The ``radius`` at which ``num_obstacles`` would comfortably fit.
@@ -548,7 +575,7 @@ def suggested_radius(
     return max(float(target_mean_radius) - 0.5 * float(annulus_offset), 0.0)
 
 
-def path_metrics(path: LineString) -> tuple[float, float]:
+def path_metrics(path) -> tuple[float, float]:
     """Return path length and cumulative unsigned turning angle.
 
     Retained for reporting. The cumulative angle is no longer sufficient
@@ -561,7 +588,7 @@ def path_metrics(path: LineString) -> tuple[float, float]:
 
 
 def pressure_profile(
-    path: LineString,
+    path,
     *,
     length_units: str = "ft",
     points_per_segment: int = 50,
@@ -577,9 +604,9 @@ def pressure_profile(
     ``s``, which is the recursion applied to the path truncated there.
 
     Under the recursive model the tip is always distal to every bend, so
-    freshly deployed body adds drag at the constant rate ``f`` and the
-    profile rises linearly within each segment. Rounding a vertex
-    multiplies the accumulated tension by ``exp(mu_c * |t|)``, so the
+    freshly deployed body adds drag at the constant rate ``lambda`` and
+    the profile rises linearly within each segment. Rounding a vertex
+    multiplies the accumulated tension by ``exp(mu * |theta|)``, so the
     profile contains two pressure values at that same cumulative length
     to display the resulting jump. (Under the old summed model the slope
     itself grew after every turn; here it does not.)
@@ -589,7 +616,7 @@ def pressure_profile(
     if not isinstance(points_per_segment, int) or points_per_segment < 1:
         raise ValueError("points_per_segment must be a positive integer.")
 
-    coords = np.asarray(path.coords, dtype=float)
+    coords = np.asarray(path, dtype=float)
 
     if len(coords) > 1:
         keep = np.concatenate((
@@ -662,74 +689,190 @@ def pressure_profile(
 # Sampling helpers
 # ------------------------------------------------------------------
 
-def sample_uniform_points(
-    region,
-    number_of_points: int,
-    rng
-) -> np.ndarray:
-    triangulation = shapely.constrained_delaunay_triangles(
-        region
-    )
-
-    triangles = [
-        triangle
-        for triangle in shapely.get_parts(triangulation)
-        if (
-            triangle.geom_type == "Polygon"
-            and triangle.area > 0
-        )
-    ]
-
-    if not triangles:
-        raise RuntimeError(
-            "The sampling region could not be triangulated."
-        )
-
-    areas = np.array(
-        [triangle.area for triangle in triangles],
-        dtype=float,
-    )
-
-    # Selecting triangles in proportion to their areas makes the
-    # final points uniform over the complete sampling region.
-    selected_indices = rng.choice(
-        len(triangles),
-        size=number_of_points,
-        replace=True,
-        p=areas / areas.sum(),
-    )
-
-    selected_triangles = np.stack(
-        [
-            np.asarray(
-                triangles[index].exterior.coords,
-                dtype=float,
-            )[:3, :2]
-            for index in selected_indices
-        ]
-    )
-
-    point_a = selected_triangles[:, 0]
-    point_b = selected_triangles[:, 1]
-    point_c = selected_triangles[:, 2]
-
-    # Uniform barycentric coordinates within each triangle.
-    random_1 = np.sqrt(rng.random(number_of_points))
-    random_2 = rng.random(number_of_points)
-
-    return (
-        (1.0 - random_1)[:, None] * point_a
-        + (
-            random_1 * (1.0 - random_2)
-        )[:, None] * point_b
-        + (
-            random_1 * random_2
-        )[:, None] * point_c
-    )
-
 # ------------------------------------------------------------------
-# Standard obstacles
+# Convex polygon primitives
 # ------------------------------------------------------------------
+#
+# Every obstacle in this package is a convex polytope, which is what lets
+# one visibility kernel serve both the 2D and the 3D course (see
+# `VisibilityMixin`). These are the handful of predicates that replaced
+# Shapely once that decision was made: for convex bodies each one is a few
+# dot products, so the general-purpose library was doing far more work
+# than the geometry needs.
+#
+# The half-space convention is fixed once here and relied on everywhere:
+# rows `a` are *outward* and *unit length*, and a point is inside when
+# `a . x + b <= 0`. Unit length is load bearing rather than cosmetic --
+# `b -= r` is only a true distance offset when `|a| = 1`, which is what
+# makes dilating an obstacle by the vine radius a single subtraction.
+
+
+@njit(cache=True, nogil=True)
+def _point_in_convex_kernel(point, polygon, tol):
+    """Is ``point`` inside a convex polygon given by its corners?
+
+    One signed area per edge. For a convex polygon wound either way the
+    point is inside when no edge puts it strictly on the outward side, so
+    the test is whether the cross products ever take both signs.
+    """
+    positive = False
+    negative = False
+
+    for k in range(polygon.shape[0]):
+        following = k + 1 if k + 1 < polygon.shape[0] else 0
+
+        cross = (
+            (polygon[following, 0] - polygon[k, 0])
+            * (point[1] - polygon[k, 1])
+            - (polygon[following, 1] - polygon[k, 1])
+            * (point[0] - polygon[k, 0])
+        )
+
+        if cross > tol:
+            positive = True
+        elif cross < -tol:
+            negative = True
+
+        if positive and negative:
+            return False
+
+    return True
+
+
+@njit(cache=True, nogil=True)
+def _convex_overlap_kernel(first, second, tol):
+    """Separating axis test between two convex polygons.
+
+    Compiled rather than vectorised because the polygons have four corners
+    on average: at that size the per-call overhead of array operations costs
+    far more than the arithmetic they save, and this runs once per candidate
+    per neighbour over the whole course.
+    """
+    for which in range(2):
+        polygon = first if which == 0 else second
+
+        for k in range(polygon.shape[0]):
+            following = k + 1 if k + 1 < polygon.shape[0] else 0
+
+            axis_x = polygon[following, 1] - polygon[k, 1]
+            axis_y = -(polygon[following, 0] - polygon[k, 0])
+
+            length = np.sqrt(axis_x * axis_x + axis_y * axis_y)
+
+            if length <= 0.0:
+                continue
+
+            axis_x /= length
+            axis_y /= length
+
+            low_a = 1.0e30
+            high_a = -1.0e30
+            for p in range(first.shape[0]):
+                value = axis_x * first[p, 0] + axis_y * first[p, 1]
+                if value < low_a:
+                    low_a = value
+                if value > high_a:
+                    high_a = value
+
+            low_b = 1.0e30
+            high_b = -1.0e30
+            for p in range(second.shape[0]):
+                value = axis_x * second[p, 0] + axis_y * second[p, 1]
+                if value < low_b:
+                    low_b = value
+                if value > high_b:
+                    high_b = value
+
+            # A gap on any one axis is a certificate of disjointness.
+            if low_a >= high_b - tol or low_b >= high_a - tol:
+                return False
+
+    return True
+
+
+def polygon_is_convex(vertices, tol: float = 1e-12) -> bool:
+    """Is this closed polygon convex and consistently wound?
+
+    The cross product of consecutive edge vectors keeps one sign around a
+    convex polygon and changes sign at a reflex corner, so one pass over
+    the corners decides it. Collinear corners give zero and are accepted:
+    they add a redundant half-space but no concavity.
+    """
+    points = np.asarray(vertices, dtype=float)
+
+    if len(points) < 3:
+        return False
+
+    edges = np.roll(points, -1, axis=0) - points
+    following = np.roll(edges, -1, axis=0)
+    crosses = edges[:, 0] * following[:, 1] - edges[:, 1] * following[:, 0]
+
+    return not (np.any(crosses > tol) and np.any(crosses < -tol))
+
+
+def polygon_area(vertices) -> float:
+    """Unsigned area of a simple polygon, by the shoelace formula."""
+    points = np.asarray(vertices, dtype=float)
+
+    if len(points) < 3:
+        return 0.0
+
+    rolled = np.roll(points, -1, axis=0)
+
+    return 0.5 * abs(float(np.sum(
+        points[:, 0] * rolled[:, 1] - rolled[:, 0] * points[:, 1]
+    )))
+
+
+def polygon_half_spaces(vertices) -> tuple[np.ndarray, np.ndarray]:
+    """Outward unit normals and offsets of a convex polygon.
+
+    Returns ``(normals, offsets)`` with one row per edge, so that the
+    polygon is exactly ``{x : normals @ x + offsets <= 0}``. The winding is
+    detected rather than assumed, so a clockwise polygon yields outward
+    normals just as a counter-clockwise one does.
+    """
+    points = np.asarray(vertices, dtype=float)
+
+    if len(points) < 3:
+        return np.zeros((0, 2)), np.zeros(0)
+
+    edges = np.roll(points, -1, axis=0) - points
+
+    # Signed area picks the winding. The right-hand normal of an edge points
+    # outwards for a counter-clockwise polygon and inwards for a clockwise
+    # one, so the sign below has to flip with it.
+    rolled = np.roll(points, -1, axis=0)
+    signed_area = 0.5 * float(np.sum(
+        points[:, 0] * rolled[:, 1] - rolled[:, 0] * points[:, 1]
+    ))
+    orientation = 1.0 if signed_area > 0.0 else -1.0
+
+    normals = orientation * np.column_stack((edges[:, 1], -edges[:, 0]))
+    lengths = np.linalg.norm(normals, axis=1)
+
+    keep = lengths > 0.0
+    normals = normals[keep] / lengths[keep, None]
+
+    # b = -a . p for any point p lying on the edge.
+    offsets = -np.einsum("ij,ij->i", normals, points[keep])
+
+    return normals, offsets
+
+
+def point_in_convex(point, normals, offsets, tol: float = 0.0) -> bool:
+    """Is ``point`` inside the polytope ``normals @ x + offsets <= 0``?
+
+    ``tol`` shifts every face outwards, so a positive value counts a point
+    just outside as inside and a negative value excludes the boundary.
+    """
+    if len(offsets) == 0:
+        return False
+
+    return bool(np.all(
+        normals @ np.asarray(point, dtype=float) + offsets <= tol
+    ))
+
 
 def sample_angles(count: int, rng: np.random.Generator) -> np.ndarray:
     """Sorted vertex angles whose largest gap stays below pi.
@@ -766,22 +909,20 @@ def sample_angles(count: int, rng: np.random.Generator) -> np.ndarray:
 class _ObstacleGrid:
     """Uniform-bin index over the obstacles already placed, keyed by bounds.
 
-    Rejecting a candidate obstacle means asking whether it is covered by the
-    course with everything already down subtracted from it. Built from the
-    whole list that subtraction costs O(N) per candidate and O(N^2) over a
-    course, which is what makes a thousand-obstacle course slow: the union
-    and the difference are rebuilt from scratch for every single obstacle.
+    Rejecting a candidate obstacle means asking whether it overlaps anything
+    already down. Scanning the whole placed list costs O(N) per candidate and
+    O(N^2) over a course, which is what made a thousand-obstacle course slow.
 
     Two polygons can only meet if their bounding boxes meet, so binning each
     one into the cells its box covers and reading back only the occupants of
-    the cells a candidate's box covers loses nothing. Every polygon left out
-    is disjoint from the candidate, so subtracting it could not have changed
-    the answer. One cell per obstacle diameter keeps a typical read to a
-    handful of polygons however many are down, which is what turns the
-    quadratic into a linear pass.
+    the cells a candidate's box covers loses nothing: every polygon left out
+    is disjoint from the candidate, so testing it could not have changed the
+    answer. One cell per obstacle diameter keeps a typical read to a handful
+    of polygons however many are down, which is what turns the quadratic into
+    a linear pass.
 
-    Bounds rather than centers because the two corner obstacles reach past
-    the course wall, so a center plus a radius does not enclose them.
+    Bounds rather than centers because the two corner obstacles reach past the
+    course wall, so a center plus a radius does not enclose them.
     """
 
     __slots__ = ("cell", "bins")
@@ -804,17 +945,24 @@ class _ObstacleGrid:
             for index_y in range(int(low_y // cell), int(high_y // cell) + 1):
                 yield index_x, index_y
 
-    def add(self, polygon) -> None:
+    def add(self, vertices) -> None:
         """Bin one polygon into every cell its bounding box touches."""
-        for key in self._keys(polygon.bounds):
-            self.bins.setdefault(key, []).append(polygon)
+        points = np.asarray(vertices, dtype=float)
+        bounds = (
+            points[:, 0].min(),
+            points[:, 1].min(),
+            points[:, 0].max(),
+            points[:, 1].max(),
+        )
+
+        for key in self._keys(bounds):
+            self.bins.setdefault(key, []).append(points)
 
     def nearby(self, bounds) -> list:
         """Every binned polygon whose box could meet the box ``bounds``.
 
-        A polygon spanning several of the queried cells is returned once:
-        the callers union or scan the result, and a duplicate would be
-        wasted work in both cases.
+        A polygon spanning several of the queried cells is returned once: the
+        caller scans the result, and a duplicate would be wasted work.
         """
         found = {}
 
@@ -832,82 +980,97 @@ def annulus_obstacle(
     max_vertices: int,
     min_radius: float,
     max_radius: float,
-    polygons: list[Polygon],
-    course_region: Polygon,
+    polygons: list,
+    course_bounds,
     *,
     forbidden_points=(),
     spanning_axis=None,
-    containment_region: Polygon = None,
+    containment_bounds=None,
     grid: "_ObstacleGrid" = None,
     max_attempts: int = 5000,
     raise_on_failure: bool = True,
-
 ):
-    """Sample one annulus obstacle entirely inside current free space.
+    """Sample one convex annulus obstacle inside the current free space.
 
-    Angles and radii retain the original annulus construction. A draw
-    is accepted only when every sampled vertex lies in the Shapely
-    free-space set and the complete candidate polygon is covered by
-    that same set. The candidate must also contain its nominal center,
-    preserving the meaning of the supplied line-placement point as the
-    obstacle center.
+    Angles and radii retain the original annulus construction. A draw is
+    accepted only when the polygon is convex, lies entirely within the
+    containing box, contains its own nominal center, and shares no interior
+    area with any obstacle already placed. Touching an existing obstacle
+    along an edge or at a corner is allowed; overlapping it is not.
 
-    ``forbidden_points`` are future line centers. Rejecting candidates
-    that cover any of them prevents an earlier obstacle from consuming
-    the center needed by a later obstacle.
+    Convexity is enforced by rejection rather than by hulling the draw. The
+    two differ: hulling would accept a reflex draw and quietly replace it
+    with a slightly larger obstacle, and doing that after the overlap test
+    could grow an obstacle into a neighbour it had already been cleared
+    against. Rejecting instead means the polygon that was tested is the
+    polygon that is stored. Roughly one draw in eight is discarded at the
+    default radii, which the attempt budget absorbs easily.
 
-    ``containment_region`` replaces ``course_region`` when an obstacle is
+    ``forbidden_points`` are future line centers. Rejecting candidates that
+    cover any of them prevents an earlier obstacle from consuming the center
+    a later obstacle needs.
+
+    ``containment_bounds`` replaces ``course_bounds`` when an obstacle is
     allowed to reach past the course walls, which only the two corner
-    obstacles are. It relaxes the wall constraint alone: the region still
-    has the placed polygons subtracted from it, so overlap with an
+    obstacles are. It relaxes the wall constraint alone: overlap with an
     existing obstacle stays forbidden.
 
-    ``spanning_axis`` forces two of the vertices onto the line through
-    the center in that direction, one on each side, each at its own
-    radius drawn from the annulus, and places one further vertex on each
-    side of that line so the ray along the axis runs through the
-    obstacle's interior rather than along an edge. Four vertices are
-    therefore the minimum when an axis is given. The obstacle then reaches its full
-    width across that direction instead of whatever width the angles
-    happened to give it, which is how a normal-sized obstacle is made to
-    block a specific line. Two opposite vertices also cap every angular
-    gap at pi, so the sorted polygon cannot self-intersect.
+    ``grid`` restricts the overlap test to obstacles binned near the
+    candidate. Every obstacle it omits has a bounding box disjoint from the
+    candidate's and therefore cannot overlap it, so the result is identical
+    to scanning ``polygons`` and the cost stops growing with the course.
+    ``polygons`` goes unread when a grid is supplied.
+
+    ``spanning_axis`` forces two of the vertices onto the line through the
+    center in that direction, one on each side, each at its own radius drawn
+    from the annulus, and places one further vertex on each side of that line
+    so the ray along the axis runs through the obstacle's interior rather
+    than along an edge. Four vertices are therefore the minimum when an axis
+    is given. The obstacle then reaches its full width across that direction
+    instead of whatever width the angles happened to give it, which is how a
+    normal-sized obstacle is made to block a specific line. Two opposite
+    vertices also cap every angular gap at pi, so the sorted polygon cannot
+    self-intersect.
     """
     center = np.asarray(center, dtype=float)
-    region = course_region if containment_region is None else containment_region
+    bounds = course_bounds if containment_bounds is None else containment_bounds
+    low_x, low_y, high_x, high_y = bounds
 
-    if grid is None:
-        free_space = shapely.difference(region, shapely.union_all(polygons))
-    else:
-        # Every candidate drawn below has its vertices within max_radius of
-        # the center, so this box encloses all of them. Obstacles outside it
-        # are disjoint from every candidate, and subtracting them would not
-        # move the free space anywhere the candidate can reach; the tests
-        # further down therefore give the same answers as they would against
-        # the full union, at a cost that does not grow with the course.
-        # ``polygons`` goes unread on this path.
-        free_space = shapely.difference(
-            region,
-            shapely.union_all(grid.nearby((
-                center[0] - max_radius,
-                center[1] - max_radius,
-                center[0] + max_radius,
-                center[1] + max_radius,
-            ))),
-        )
-
-    center_point = Point(center)
-    forbidden_geometry = (
-        shapely.points(np.asarray(forbidden_points, dtype=float))
+    forbidden = (
+        np.asarray(forbidden_points, dtype=float)
         if len(forbidden_points)
         else None
     )
 
-    if not shapely.covers(free_space, center_point):
+    # Only obstacles whose bounding box meets the candidate's can overlap it,
+    # and every candidate drawn below has its vertices within max_radius of
+    # the center, so this box encloses all of them.
+    if grid is None:
+        neighbours = [np.asarray(polygon, dtype=float) for polygon in polygons]
+    else:
+        neighbours = grid.nearby((
+            center[0] - max_radius,
+            center[1] - max_radius,
+            center[0] + max_radius,
+            center[1] + max_radius,
+        ))
+
+    # The center itself has to be free, or there is nothing to sample around.
+    for neighbour in neighbours:
+        if _point_in_convex_kernel(center, neighbour, 0.0):
+            if raise_on_failure:
+                raise RuntimeError(
+                    "The requested obstacle center is not in the current "
+                    "free space."
+                )
+
+            return None
+
+    if not (low_x <= center[0] <= high_x and low_y <= center[1] <= high_y):
         if raise_on_failure:
             raise RuntimeError(
-                "The requested obstacle center is not in the current "
-                "Shapely free-space region."
+                "The requested obstacle center lies outside the region the "
+                "obstacle must be contained by."
             )
 
         return None
@@ -926,11 +1089,11 @@ def annulus_obstacle(
         if spanning_axis is None:
             angles = sample_angles(number_of_vertices, rng)
         else:
-            # The two forced vertices sit half a turn apart on the
-            # spanning axis; the rest are ordinary uniform draws. Sorting
-            # the combined set keeps the polygon star shaped about the
-            # center, and no gap can exceed pi because the forced pair
-            # already splits the circle in half.
+            # The two forced vertices sit half a turn apart on the spanning
+            # axis; the rest are ordinary uniform draws. Sorting the combined
+            # set keeps the polygon star shaped about the center, and no gap
+            # can exceed pi because the forced pair already splits the circle
+            # in half.
             axis_angle = np.arctan2(
                 float(spanning_axis[1]),
                 float(spanning_axis[0]),
@@ -938,11 +1101,11 @@ def annulus_obstacle(
 
             # One free vertex is placed on each side of the axis before the
             # rest are drawn over the whole circle. Left to chance they can
-            # all land on one side, which leaves a gap of exactly pi: the
-            # edge joining the forced pair then runs straight through the
-            # center, so the center and every point along the axis ray lie
-            # on the boundary rather than inside it. Straddling makes every
-            # gap strictly less than pi, which puts the whole ray out to the
+            # all land on one side, which leaves a gap of exactly pi: the edge
+            # joining the forced pair then runs straight through the center,
+            # so the center and every point along the axis ray lie on the
+            # boundary rather than inside it. Straddling makes every gap
+            # strictly less than pi, which puts the whole ray out to the
             # forced vertex in the interior.
             angles = np.sort(np.mod(
                 np.concatenate((
@@ -958,12 +1121,8 @@ def annulus_obstacle(
                 2.0 * np.pi,
             ))
 
-        radii = rng.uniform(
-            min_radius,
-            max_radius,
-            number_of_vertices,
-        )
-        vertices = (
+        radii = rng.uniform(min_radius, max_radius, number_of_vertices)
+        candidate = (
             center
             + radii[:, None] * np.column_stack((
                 np.cos(angles),
@@ -971,32 +1130,45 @@ def annulus_obstacle(
             ))
         )
 
-        # Enforce the vertex-level requirement directly using the
-        # Shapely set difference defining the current free space.
-        vertex_points = shapely.points(vertices)
-        if not np.all(shapely.covers(free_space, vertex_points)):
+        # Every obstacle in the package is a convex polytope; a reflex draw
+        # is discarded rather than repaired.
+        if not polygon_is_convex(candidate):
             continue
 
-        candidate = Polygon(vertices)
+        if polygon_area(candidate) <= 0.0:
+            continue
 
+        # The box is convex, so containing every vertex is the same as
+        # containing the whole polygon.
         if (
-            candidate.is_empty
-            or not candidate.is_valid
-            or candidate.area <= 0.0
-            or not shapely.contains(candidate, center_point)
+            candidate[:, 0].min() < low_x
+            or candidate[:, 0].max() > high_x
+            or candidate[:, 1].min() < low_y
+            or candidate[:, 1].max() > high_y
         ):
             continue
 
-        # Vertices being free is not sufficient by itself: an edge can
-        # cross an occupied polygon while both endpoints remain free.
-        # Requiring the whole candidate to be covered by free space
-        # guarantees zero positive-area overlap. Boundary contact is
-        # allowed, but obstacle interiors remain disjoint.
-        if not shapely.covers(free_space, candidate):
+        normals, offsets = polygon_half_spaces(candidate)
+
+        # The nominal center has to be strictly inside, which is what gives
+        # the supplied line-placement point its meaning.
+        if not point_in_convex(center, normals, offsets, tol=-1e-12):
             continue
 
-        if forbidden_geometry is not None and np.any(
-            shapely.intersects(candidate, forbidden_geometry)
+        if forbidden is not None and np.any(
+            np.all(forbidden @ normals.T + offsets <= 0.0, axis=1)
+        ):
+            continue
+
+        # Vertices being free is not sufficient by itself: an edge can cross
+        # an occupied polygon while both endpoints remain free. The separating
+        # axis test covers the whole body, so obstacle interiors stay disjoint
+        # while boundary contact remains allowed.
+        contiguous = np.ascontiguousarray(candidate)
+
+        if any(
+            _convex_overlap_kernel(contiguous, neighbour, 1e-12)
+            for neighbour in neighbours
         ):
             continue
 
@@ -1011,9 +1183,6 @@ def annulus_obstacle(
 
     return None
 
-# ------------------------------------------------------------------
-# Clusters in the two corners the barriers do not reach
-# ------------------------------------------------------------------
 
 def clip_segment(
     start: np.ndarray,
@@ -1069,41 +1238,87 @@ def free_parameter_intervals(
     start: np.ndarray,
     end: np.ndarray,
     span: tuple[float, float],
-    polygons: list[Polygon]
+    polygons: list,
 ) -> list[tuple[float, float]]:
-    """Intervals whose shifted-line centers lie in current free space.
+    """Intervals of the wall-clipped line that lie in current free space.
 
-    The wall-clipped line is differenced from the current occupied
-    polygon union with Shapely. Each remaining LineString component is
-    then converted back to the original segment parameter.
+    Each obstacle is convex, so the part of the line inside it is a single
+    parameter interval found by clipping the line against that obstacle's
+    half-spaces. Subtracting the union of those intervals from the clipped
+    span leaves the free ones, which is the same answer a polygon-set
+    difference would give without needing a polygon set.
     """
     low, high = span
     direction = end - start
     squared_length = float(np.dot(direction, direction))
 
-    clipped_start = start + low * direction
-    clipped_end = start + high * direction
-    clipped_line = LineString((clipped_start, clipped_end))
-    occupied_region = shapely.union_all(polygons)
-    free_line = shapely.difference(clipped_line, occupied_region)
-    intervals = []
+    if squared_length <= 0.0 or high <= low:
+        return []
 
-    for part in shapely.get_parts(free_line):
-        if part.geom_type != "LineString" or part.length <= 0.0:
+    blocked = []
+
+    for polygon in polygons:
+        normals, offsets = polygon_half_spaces(polygon)
+
+        if len(offsets) == 0:
             continue
 
-        coordinates = np.asarray(part.coords, dtype=float)
-        parameters = (
-            (coordinates - start) @ direction / squared_length
-        )
-        interval_low = max(low, float(parameters.min()))
-        interval_high = min(high, float(parameters.max()))
+        # f_i(t) = (a_i . d) t + (a_i . start + b_i), inside where every
+        # f_i <= 0. Each face tightens one end of the surviving interval.
+        denominators = normals @ direction
+        numerators = normals @ start + offsets
 
-        if interval_high > interval_low:
-            intervals.append((interval_low, interval_high))
+        enter, exit_ = low, high
 
-    intervals.sort()
-    return intervals
+        for denominator, numerator in zip(denominators, numerators):
+            if abs(denominator) <= 1e-15:
+                # Parallel to this face: either the whole line is outside it
+                # or the face constrains nothing.
+                if numerator > 0.0:
+                    enter = 1.0
+                    exit_ = 0.0
+                    break
+
+                continue
+
+            crossing = -numerator / denominator
+
+            if denominator > 0.0:
+                exit_ = min(exit_, crossing)
+            else:
+                enter = max(enter, crossing)
+
+            if enter >= exit_:
+                break
+
+        if exit_ > enter:
+            blocked.append((enter, exit_))
+
+    if not blocked:
+        return [(low, high)]
+
+    blocked.sort()
+
+    intervals = []
+    cursor = low
+
+    for interval_low, interval_high in blocked:
+        if interval_low > cursor:
+            intervals.append((cursor, min(interval_low, high)))
+
+        cursor = max(cursor, interval_high)
+
+        if cursor >= high:
+            break
+
+    if cursor < high:
+        intervals.append((cursor, high))
+
+    return [
+        (interval_low, interval_high)
+        for interval_low, interval_high in intervals
+        if interval_high > interval_low
+    ]
 
 def intersect_intervals(
     first: list[tuple[float, float]],
@@ -1265,9 +1480,9 @@ def place_random_obstacles(
     max_vertices: int,
     min_radius: float,
     max_radius: float,
-    polygons: list[Polygon],
-    course_region: Polygon,
-    center_region: Polygon,
+    polygons: list,
+    course_bounds,
+    center_bounds,
     attempts_per_obstacle: int = 64,
 ) -> int:
     """Add obstacles whose centers are drawn from the remaining free space.
@@ -1300,7 +1515,7 @@ def place_random_obstacles(
     for polygon in polygons:
         grid.add(polygon)
 
-    low_x, low_y, high_x, high_y = center_region.bounds
+    low_x, low_y, high_x, high_y = center_bounds
 
     # A ceiling on draws as well as on centers, so a course with no room
     # left returns instead of spinning: without it the rejection loop keeps
@@ -1320,10 +1535,8 @@ def place_random_obstacles(
                 rng.uniform(low_y, high_y),
             ])
 
-            point = Point(center)
-
             if any(
-                shapely.covers(neighbour, point)
+                _point_in_convex_kernel(center, neighbour, 0.0)
                 for neighbour in grid.nearby(
                     (center[0], center[1], center[0], center[1])
                 )
@@ -1340,7 +1553,7 @@ def place_random_obstacles(
                 min_radius,
                 max_radius,
                 polygons,
-                course_region,
+                course_bounds,
                 grid=grid,
                 max_attempts=64,
                 raise_on_failure=False,

@@ -3,12 +3,12 @@
 Why this exists rather than a ``tikzplotlib`` call
 --------------------------------------------------
 ``tikzplotlib`` walks a finished Matplotlib figure and re-emits its artists.
-An obstacle course is mostly ``matplotlib.patches.PathPatch`` objects created
-by ``shapely.plotting.plot_polygon``, which is exactly the artist class that
-converter does not handle, so the obstacles come out empty. Nothing about the
-figure is worth recovering anyway: the geometry is already available as
-polygons and vertex arrays, and going straight from those to coordinates is
-both shorter and far more controllable than post-processing a rendered figure.
+An obstacle course is mostly ``matplotlib.patches.Polygon`` objects, which is
+exactly the artist class that converter does not handle, so the obstacles come
+out empty. Nothing about the figure is worth recovering anyway: the geometry is
+already available as vertex arrays, and going straight from those to
+coordinates is both shorter and far more controllable than post-processing a
+rendered figure.
 
 What is emitted
 ---------------
@@ -430,29 +430,19 @@ def course_tikz(
     vertices = []
 
     obstacles = [
-        obstacle
+        np.asarray(obstacle, dtype=float)
         for obstacle in (course.obstacles or [])
-        if obstacle is not None and not obstacle.is_empty
+        if obstacle is not None and len(np.asarray(obstacle)) >= 3
     ]
 
     if obstacles:
         content.append("    % obstacles")
 
-    for index, obstacle in enumerate(obstacles, start=1):
-        rings = [obstacle.exterior, *obstacle.interiors]
-
-        # A hole would have to be subtracted, not merely stroked. Nothing in
-        # the generator produces one, so this is a guard rather than a
-        # feature: emitting the ring alone would silently draw a filled
-        # obstacle where a ring-shaped one was meant.
-        if obstacle.interiors:
-            raise NotImplementedError(
-                f"obstacle {index} has an interior ring; only simply "
-                "connected obstacles are supported."
-            )
-
-        coordinates = np.asarray(rings[0].coords, dtype=float)
-        vertices.append(coordinates[:-1])
+    for obstacle in obstacles:
+        # Obstacles are convex and stored open, so closing the ring here is
+        # all that separates the stored corners from a drawable outline.
+        coordinates = np.vstack((obstacle, obstacle[:1]))
+        vertices.append(obstacle)
 
         content.append(
             "    \\addplot[vine/obstacle, forget plot] coordinates "
@@ -532,7 +522,7 @@ def course_tikz(
         if path is None:
             continue
 
-        coordinates = np.asarray(path.coords, dtype=float)
+        coordinates = np.asarray(path, dtype=float)
         path_length, path_angle = path_metrics(path)
 
         # Evaluated in course units. The display setting cannot reach the
@@ -608,7 +598,7 @@ def pressure_tikz(
 
     ``points_per_segment`` defaults to 1 rather than the Matplotlib method's
     50. Under the recursive model the tip is distal to every bend, so freshly
-    deployed body adds drag at the constant rate ``f`` and the profile is
+    deployed body adds drag at the constant rate ``lambda`` and the profile is
     *exactly* affine within each segment; the jump at a vertex is carried by
     the duplicated abscissa the profile already emits. One interval per
     segment is therefore not an approximation, it is the exact curve, and it

@@ -19,8 +19,6 @@ except ImportError as _error:  # pragma: no cover
         "search used by ObstacleCourse.random."
     ) from _error
 
-from shapely import LineString
-
 from .constants import (
     YIELD_PRESSURE_PSI,
     LENGTH_FRICTION_PSI_PER_FT,
@@ -74,7 +72,7 @@ from .utils import (
 # The multiplicative factor is what forces the issue rather than merely
 # rewarding it. The affine update is
 #
-#     tau' = alpha * tau + beta,   alpha = exp(mu_c * theta),  beta = f * l_out
+#     tau' = alpha * tau + beta,   alpha = exp(mu * theta),  beta = lambda * l_out
 #
 # and beta depends only on the outgoing edge, so it is a 2m array. alpha
 # depends on the *arc*, so there are sum deg^2 of them and they cannot be
@@ -95,7 +93,8 @@ from .utils import (
 # labels are nondecreasing along every path, which is precisely the condition
 # that makes label-setting sound: the minimum open label can never be improved
 # by a longer prefix, so a settled node stays settled. Both hold here whenever
-# mu_c >= 0 and f >= 0, and the constructor checks them rather than assuming.
+# mu >= 0 and lambda >= 0, and the constructor checks them rather than
+# assuming.
 #
 # The minimum-turning planner is the same recursion with alpha == 1 and
 # beta = theta, so it runs through the identical kernel. That is deliberate:
@@ -112,12 +111,13 @@ class PathPlanner:
     start: np.ndarray | None = field(default=None)
     end: np.ndarray | None = field(default=None)
 
-    # Units the course coordinates are expressed in. The friction term of the
-    # pressure model is psi per foot, so the planner has to know this to build
+    # Units the course coordinates are expressed in. The length dependent
+    # friction term lambda of the pressure model is psi per foot, so the
+    # planner has to know this to build
     # its costs.
     #
     # This is a *model* parameter, not a display one: it sets the drag term
-    # beta = f * l * scale, and therefore how heavily length is weighed
+    # beta = lambda * l * scale, and therefore how heavily length is weighed
     # against bend amplification in the objective. Two planners differing only
     # in this field are solving different problems and can return different
     # paths. There is no default that is right for every course -- 'ft' is
@@ -125,6 +125,16 @@ class PathPlanner:
     # actually mean.
     length_units: str = field(default="ft")
 
+    # Parameters of the governing equation
+    #
+    #     P A = Y A + lambda L + T exp(mu theta),
+    #
+    # named in full here and written as their symbols elsewhere: Y is the
+    # yield pressure required to evert the vine, lambda the length dependent
+    # friction term between the inside of the body and the tail, T the
+    # tension in the tail caused by the tug of the reel, and mu the Capstan
+    # friction coefficient for a bend. Divided through by the cross sectional
+    # area A, lambda and T carry pressure units, which is how they are held.
     yield_pressure: float = field(default=YIELD_PRESSURE_PSI)
     length_friction: float = field(default=LENGTH_FRICTION_PSI_PER_FT)
     tail_tension: float = field(default=TAIL_TENSION_PSI)
@@ -152,13 +162,13 @@ class PathPlanner:
     edge_drag: np.ndarray | None = field(init=False, default=None)
     reverse: np.ndarray | None = field(init=False, default=None)
 
-    distance_path: LineString | None = field(init=False, default=None)
+    distance_path: np.ndarray | None = field(init=False, default=None)
     total_distance: float | None = field(init=False, default=None)
 
-    angle_path: LineString | None = field(init=False, default=None)
+    angle_path: np.ndarray | None = field(init=False, default=None)
     total_angle: float | None = field(init=False, default=None)
 
-    pressure_path: LineString | None = field(init=False, default=None)
+    pressure_path: np.ndarray | None = field(init=False, default=None)
     total_pressure: float | None = field(init=False, default=None)
 
     def __attrs_post_init__(self):
@@ -466,7 +476,7 @@ class PathPlanner:
         objective       alpha                        beta
         ==============  ===========================  =====================
         ``"angle"``     ``1``                        ``theta`` (per arc)
-        ``"pressure"``  ``exp(mu_c * theta)``        ``f * l_out``
+        ``"pressure"``  ``exp(mu * theta)``          ``lambda * l_out``
         ==============  ===========================  =====================
 
         Returns the vertex-index path, the label at the terminal directed
@@ -595,7 +605,7 @@ class PathPlanner:
 
         return np.asarray(path_indices, dtype=np.int64), float(label[terminal]), label
 
-    def compute_distance_path(self) -> LineString:
+    def compute_distance_path(self) -> np.ndarray:
         """Compute and store the minimum-distance visibility-graph path.
 
         Runs on the base graph, not the line graph. A shortest path under
@@ -620,11 +630,11 @@ class PathPlanner:
             path_indices.append(int(predecessors[path_indices[-1]]))
         path_indices.reverse()
 
-        self.distance_path = LineString(self.coords[path_indices])
+        self.distance_path = self.coords[path_indices]
         self.total_distance = float(distances[self.end_index])
         return self.distance_path
 
-    def compute_angle_path(self) -> LineString:
+    def compute_angle_path(self) -> np.ndarray:
         """Compute and store the minimum-cumulative-turn path.
 
         This is the proxy-metric baseline: the same recursion as the pressure
@@ -632,22 +642,22 @@ class PathPlanner:
         """
         path_indices, total, _ = self._dijkstra_line_graph("angle")
 
-        self.angle_path = LineString(self.coords[path_indices])
+        self.angle_path = self.coords[path_indices]
         self.total_angle = total
         return self.angle_path
 
-    def compute_pressure_path(self, verify: bool = True) -> LineString:
+    def compute_pressure_path(self, verify: bool = True) -> np.ndarray:
         """Compute and store the globally minimum-growth-pressure path.
 
         The label carried through the search is
 
-            M_i = tau_{i-1} + f * l_i,
+            M_i = tau_{i-1} + lambda * l_i,
 
         the tension accumulated through segment ``i`` but before the bend at
         its head is charged. That is the quantity the affine update acts on,
         and it makes the terminal case fall out rather than needing the
         phantom zero-angle bend the evaluator uses: the label at a directed
-        edge arriving at the goal is already ``tau_{n-1} + f * l_n``, so
+        edge arriving at the goal is already ``tau_{n-1} + lambda * l_n``, so
 
             P = Y + M_n.
 
@@ -658,7 +668,7 @@ class PathPlanner:
         """
         path_indices, tension, _ = self._dijkstra_line_graph("pressure")
 
-        self.pressure_path = LineString(self.coords[path_indices])
+        self.pressure_path = self.coords[path_indices]
         self.total_pressure = float(self.yield_pressure + tension)
 
         if verify:
@@ -678,7 +688,7 @@ class PathPlanner:
 
         return self.pressure_path
 
-    def compute_all_paths(self) -> dict[str, LineString]:
+    def compute_all_paths(self) -> dict[str, np.ndarray]:
         """Run all three planners and return them by name."""
         return {
             "distance": self.compute_distance_path(),
