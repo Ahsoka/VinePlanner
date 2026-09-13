@@ -54,6 +54,14 @@ _DEFAULT_MAXIMUM_OBSTACLES = 40
 # course in both axes.
 _GOAL_BOX_FRACTION = 0.25
 
+# How far `ObstacleCourse` shrinks its obstacle region to build the eroded
+# copy `is_visible` tests against, as a fraction of the smaller course
+# dimension. See the note in `__attrs_post_init__` for why the eroded set
+# exists; the value only has to sit between double-precision noise at the
+# coordinate magnitudes involved and the smallest real feature, which leaves
+# several orders of magnitude of room either side.
+_EROSION_FRACTION = 1e-9
+
 
 def _length_conversion(source_units: str, target_units: str) -> float:
     """Multiplier taking a length in ``source_units`` to ``target_units``.
@@ -160,10 +168,33 @@ class ObstacleCourse(VisibilityMixin):
     obstacles: list[Polygon] = field(factory=list)
 
     obstacles_region = field(init=False)
+    obstacles_region_eroded = field(init=False)
 
     def __attrs_post_init__(self):
         self.obstacles_region = shapely.union_all(self.obstacles)
         shapely.prepare(self.obstacles_region)
+
+        # `is_visible` has to separate a segment that passes through an
+        # obstacle from one that merely runs along its boundary, which a
+        # minimum-pressure path is allowed to do. Asking GEOS that question
+        # directly, with `touches`, costs a full DE-9IM relate against the
+        # whole multipolygon: ~35x a `disjoint` call, and it dominates the
+        # visibility graph at every course size.
+        #
+        # Shrinking the region by a hair answers it with `disjoint` alone.
+        # A segment grazing the boundary misses the eroded set entirely,
+        # while one crossing the interior still cuts a chord through it,
+        # so the two cases separate without the relate.
+        #
+        # The offset is scaled to the course so it stays far above double
+        # precision at the coordinate magnitudes in play, and far below any
+        # feature size: an obstacle would have to be ~1e-9 of the course
+        # across before erosion could erase it.
+        self.obstacles_region_eroded = shapely.buffer(
+            self.obstacles_region,
+            -_EROSION_FRACTION * min(self.width, self.height),
+        )
+        shapely.prepare(self.obstacles_region_eroded)
 
     @property
     def dimension(self) -> int:
@@ -1006,8 +1037,14 @@ class ObstacleCourse(VisibilityMixin):
 
         Shapely 2's predicates are numpy ufuncs that broadcast one geometry
         against an array of them, so the whole batch crosses into GEOS in a
-        single call. ``shapely.prepare`` was applied to the obstacle region at
-        construction, which builds its index once instead of per query.
+        single call. ``shapely.prepare`` was applied to the eroded obstacle
+        region at construction, which builds its index once instead of per
+        query.
+
+        A segment running along an obstacle boundary stays visible, which is
+        what lets a minimum-pressure path hug a wall. That case is separated
+        from a segment cutting through an obstacle by the erosion rather than
+        by a ``touches`` call; see ``__attrs_post_init__``.
         """
         start = np.asarray(vertex1, dtype=float)
         end = np.asarray(vertex2, dtype=float)
@@ -1032,11 +1069,10 @@ class ObstacleCourse(VisibilityMixin):
             indices=np.repeat(np.arange(len(start)), 2),
         )
 
-        region = self.obstacles_region
-
-        # "touches" keeps a path that runs along an obstacle boundary legal,
-        # which is what a minimum-pressure path wants to do.
-        visible = shapely.disjoint(region, lines) | shapely.touches(region, lines)
+        # Missing the eroded region keeps a path that runs along an obstacle
+        # boundary legal, which is what a minimum-pressure path wants to do,
+        # and costs one cheap predicate instead of `disjoint | touches`.
+        visible = shapely.disjoint(self.obstacles_region_eroded, lines)
 
         return bool(visible[0]) if scalar else visible
 

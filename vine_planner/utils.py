@@ -488,7 +488,7 @@ def obstacle_capacity(
     max_vertices: int,
     min_radius: float,
     max_radius: float,
-    packing_coefficient: float = 0.65,
+    packing_coefficient: float = 0.6,
 ) -> int:
     """Roughly the largest number of obstacles that will fit.
 
@@ -762,6 +762,69 @@ def sample_angles(count: int, rng: np.random.Generator) -> np.ndarray:
         + rng.uniform(0.0, 2.0 * np.pi / count)
     )
 
+
+class _ObstacleGrid:
+    """Uniform-bin index over the obstacles already placed, keyed by bounds.
+
+    Rejecting a candidate obstacle means asking whether it is covered by the
+    course with everything already down subtracted from it. Built from the
+    whole list that subtraction costs O(N) per candidate and O(N^2) over a
+    course, which is what makes a thousand-obstacle course slow: the union
+    and the difference are rebuilt from scratch for every single obstacle.
+
+    Two polygons can only meet if their bounding boxes meet, so binning each
+    one into the cells its box covers and reading back only the occupants of
+    the cells a candidate's box covers loses nothing. Every polygon left out
+    is disjoint from the candidate, so subtracting it could not have changed
+    the answer. One cell per obstacle diameter keeps a typical read to a
+    handful of polygons however many are down, which is what turns the
+    quadratic into a linear pass.
+
+    Bounds rather than centers because the two corner obstacles reach past
+    the course wall, so a center plus a radius does not enclose them.
+    """
+
+    __slots__ = ("cell", "bins")
+
+    def __init__(self, cell: float):
+        if cell <= 0:
+            raise ValueError("cell must be positive.")
+
+        self.cell = float(cell)
+        self.bins = {}
+
+    def _keys(self, bounds):
+        """Every cell the axis-aligned box ``bounds`` touches."""
+        low_x, low_y, high_x, high_y = bounds
+        cell = self.cell
+
+        # Float floor division, so negative coordinates bin downwards rather
+        # than towards zero and the lattice stays uniform across the origin.
+        for index_x in range(int(low_x // cell), int(high_x // cell) + 1):
+            for index_y in range(int(low_y // cell), int(high_y // cell) + 1):
+                yield index_x, index_y
+
+    def add(self, polygon) -> None:
+        """Bin one polygon into every cell its bounding box touches."""
+        for key in self._keys(polygon.bounds):
+            self.bins.setdefault(key, []).append(polygon)
+
+    def nearby(self, bounds) -> list:
+        """Every binned polygon whose box could meet the box ``bounds``.
+
+        A polygon spanning several of the queried cells is returned once:
+        the callers union or scan the result, and a duplicate would be
+        wasted work in both cases.
+        """
+        found = {}
+
+        for key in self._keys(bounds):
+            for polygon in self.bins.get(key, ()):
+                found[id(polygon)] = polygon
+
+        return list(found.values())
+
+
 def annulus_obstacle(
     center: np.ndarray,
     rng: np.random.Generator,
@@ -775,6 +838,7 @@ def annulus_obstacle(
     forbidden_points=(),
     spanning_axis=None,
     containment_region: Polygon = None,
+    grid: "_ObstacleGrid" = None,
     max_attempts: int = 5000,
     raise_on_failure: bool = True,
 
@@ -811,7 +875,27 @@ def annulus_obstacle(
     """
     center = np.asarray(center, dtype=float)
     region = course_region if containment_region is None else containment_region
-    free_space = shapely.difference(region, shapely.union_all(polygons))
+
+    if grid is None:
+        free_space = shapely.difference(region, shapely.union_all(polygons))
+    else:
+        # Every candidate drawn below has its vertices within max_radius of
+        # the center, so this box encloses all of them. Obstacles outside it
+        # are disjoint from every candidate, and subtracting them would not
+        # move the free space anywhere the candidate can reach; the tests
+        # further down therefore give the same answers as they would against
+        # the full union, at a cost that does not grow with the course.
+        # ``polygons`` goes unread on this path.
+        free_space = shapely.difference(
+            region,
+            shapely.union_all(grid.nearby((
+                center[0] - max_radius,
+                center[1] - max_radius,
+                center[0] + max_radius,
+                center[1] + max_radius,
+            ))),
+        )
+
     center_point = Point(center)
     forbidden_geometry = (
         shapely.points(np.asarray(forbidden_points, dtype=float))
@@ -1193,28 +1277,61 @@ def place_random_obstacles(
     obstacle; the annulus sampler then rejects any candidate whose body
     would overlap. Returns how many were actually placed, which falls
     short of ``count`` only when the course has run out of room.
+
+    Both halves of that are done against a ``_ObstacleGrid`` rather than
+    against the whole placed list. Drawing uniformly from the bounding box
+    of ``center_region`` and throwing away the draws that land on an
+    obstacle is uniform over the free part of it, which is the distribution
+    the triangulation of that free part used to sample; the grid answers
+    the "lands on an obstacle" question in constant time. Note that the two
+    consume random numbers differently, so a seed that reproduced a given
+    course before will not reproduce it now.
     """
     placed = 0
 
+    if count <= 0:
+        return placed
+
+    # One cell per obstacle diameter: big enough that a candidate reads only
+    # its own cell and the ones it straddles, small enough that each read
+    # stays a handful of polygons at any course size.
+    grid = _ObstacleGrid(2.0 * max_radius)
+
+    for polygon in polygons:
+        grid.add(polygon)
+
+    low_x, low_y, high_x, high_y = center_region.bounds
+
+    # A ceiling on draws as well as on centers, so a course with no room
+    # left returns instead of spinning: without it the rejection loop keeps
+    # drawing occupied points and never reaches the center count.
+    maximum_draws = 64 * attempts_per_obstacle
+
     for _ in range(count):
-        free_space = shapely.difference(
-            center_region,
-            shapely.union_all(polygons),
-        )
+        obstacle = None
+        centers_tried = 0
+        draws = 0
 
-        if free_space.is_empty or free_space.area <= 0.0:
-            return placed
+        while centers_tried < attempts_per_obstacle and draws < maximum_draws:
+            draws += 1
 
-        try:
-            candidates = sample_uniform_points(
-                free_space,
-                attempts_per_obstacle,
-                rng,
-            )
-        except RuntimeError:
-            return placed
+            center = np.array([
+                rng.uniform(low_x, high_x),
+                rng.uniform(low_y, high_y),
+            ])
 
-        for center in candidates:
+            point = Point(center)
+
+            if any(
+                shapely.covers(neighbour, point)
+                for neighbour in grid.nearby(
+                    (center[0], center[1], center[0], center[1])
+                )
+            ):
+                continue
+
+            centers_tried += 1
+
             obstacle = annulus_obstacle(
                 center,
                 rng,
@@ -1224,15 +1341,19 @@ def place_random_obstacles(
                 max_radius,
                 polygons,
                 course_region,
+                grid=grid,
                 max_attempts=64,
                 raise_on_failure=False,
             )
 
             if obstacle is not None:
-                polygons.append(obstacle)
-                placed += 1
                 break
-        else:
+
+        if obstacle is None:
             return placed
+
+        polygons.append(obstacle)
+        grid.add(obstacle)
+        placed += 1
 
     return placed
