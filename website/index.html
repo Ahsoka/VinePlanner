@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VinePlanner: An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots</title>
+  <meta name="description" content="A globally optimal minimum-pressure growth planner for vine robots, with the open-source Python package VinePlanner.">
+
+  <!-- Link previews (iMessage, Discord, Slack, X, LinkedIn, ...).
+       og:image and og:url MUST be absolute URLs; most preview scrapers ignore relative paths. -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ahsoka.github.io/VinePlanner/">
+  <meta property="og:title" content="VinePlanner: An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots">
+  <meta property="og:description" content="A globally optimal minimum-pressure growth planner for vine robots.">
+  <meta property="og:image" content="https://ahsoka.github.io/VinePlanner/assets/preview.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Four vine robot paths grown through a 2D obstacle course">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+
+  <style>
+    body { font-family: 'Noto Sans', sans-serif; }
+
+    .publication-title,
+    .title { font-family: 'Google Sans', sans-serif; }
+
+    .publication-title { line-height: 1.2; }
+
+    .publication-authors { font-family: 'Google Sans', sans-serif; font-size: 1.25rem; }
+    .publication-authors a { color: hsl(204, 86%, 53%) !important; }
+    .publication-authors a:hover { text-decoration: underline; }
+    .author-block { display: inline-block; margin: 0 0.3em; }
+
+    .affiliations { font-size: 1.05rem; color: #4a4a4a; }
+
+    .publication-links { margin-top: 1.25rem; }
+    .link-block { display: inline-block; margin: 0.25rem 0.2rem; }
+    .link-block a.button { background-color: #363636; color: #fff; border: none; }
+    .link-block a.button:hover { background-color: #000; }
+
+    .teaser img {
+      width: 100%;
+      border-radius: 8px;
+    }
+    .caption { font-size: 0.95rem; color: #4a4a4a; margin-top: 0.75rem; }
+
+    .section { padding: 2.5rem 1.5rem; }
+
+    /* 16:9 responsive YouTube embed */
+    .video-wrapper {
+      position: relative;
+      padding-bottom: 56.25%;
+      height: 0;
+      overflow: hidden;
+      border-radius: 8px;
+    }
+    .video-wrapper iframe {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      border: 0;
+    }
+
+    .demo-placeholder {
+      border: 2px dashed #b5b5b5;
+      border-radius: 8px;
+      min-height: 420px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #7a7a7a;
+      background: #fafafa;
+      text-align: center;
+      padding: 2rem;
+    }
+    .demo-placeholder i { font-size: 2.5rem; margin-bottom: 1rem; }
+
+    pre.bibtex {
+      background: #f5f5f5;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+
+    footer.footer { padding: 2rem 1.5rem; }
+  </style>
+</head>
+
+<body>
+
+<!-- ===================================================================
+     Header: title, authors, links
+     =================================================================== -->
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop has-text-centered">
+
+      <h1 class="title is-1 publication-title">
+        VinePlanner: An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots
+      </h1>
+
+      <div class="publication-authors">
+        <!-- Add a link here once your personal website exists:
+             <a href="https://..." target="_blank" rel="noopener noreferrer">Andres C. Torres</a> -->
+        <span class="author-block">Andres C. Torres<sup>1</sup>,</span>
+        <span class="author-block">
+          <a href="https://tobiamarcucci.github.io/" target="_blank" rel="noopener noreferrer">Tobia Marcucci</a><sup>2,1</sup>,
+        </span>
+        <span class="author-block">
+          <a href="https://scholar.google.com/citations?user=7rY7A5oAAAAJ" target="_blank" rel="noopener noreferrer">Elliot W. Hawkes</a><sup>1</sup>
+        </span>
+      </div>
+
+      <div class="affiliations mt-2">
+        <span class="author-block"><sup>1</sup>Department of Mechanical Engineering, UC Santa Barbara</span><br>
+        <span class="author-block"><sup>2</sup>Department of Electrical and Computer Engineering, UC Santa Barbara</span>
+      </div>
+
+      <div class="publication-links">
+        <span class="link-block">
+          <a href="https://arxiv.org/pdf/2609.18070" target="_blank" rel="noopener noreferrer"
+             class="button is-normal is-rounded">
+            <span class="icon"><i class="fas fa-file-pdf"></i></span>
+            <span>Paper</span>
+          </a>
+        </span>
+        <span class="link-block">
+          <a href="https://arxiv.org/abs/2609.18070" target="_blank" rel="noopener noreferrer"
+             class="button is-normal is-rounded">
+            <span class="icon"><i class="ai ai-arxiv"></i></span>
+            <span>arXiv</span>
+          </a>
+        </span>
+        <span class="link-block">
+          <!-- PLACEHOLDER: replace with your real video link -->
+          <a href="https://www.youtube.com/watch?v=jNQXAC9IVRw" target="_blank" rel="noopener noreferrer"
+             class="button is-normal is-rounded">
+            <span class="icon"><i class="fab fa-youtube"></i></span>
+            <span>Video</span>
+          </a>
+        </span>
+        <span class="link-block">
+          <a href="https://github.com/Ahsoka/VinePlanner" target="_blank" rel="noopener noreferrer"
+             class="button is-normal is-rounded">
+            <span class="icon"><i class="fab fa-github"></i></span>
+            <span>Code</span>
+          </a>
+        </span>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     Teaser image
+     =================================================================== -->
+<section class="hero teaser">
+  <div class="container is-max-desktop">
+    <div class="hero-body pt-0">
+      <img src="assets/teaser.jpg"
+           alt="Four near-optimal vine robot paths grown through a 2D obstacle course, overlaid in one photo">
+      <p class="caption has-text-centered">
+        Four near-optimal paths through a 2D obstacle course, grown in hardware and overlaid
+        into a single image. The minimum-pressure path is shown in green.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     Abstract
+     =================================================================== -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified">
+          <p>
+            Vine robots navigate cluttered environments by extending from their tip. Although their
+            ability to operate in such environments has been extensively demonstrated, little work
+            has addressed growth planning, i.e., finding optimal growth paths. Moreover, existing
+            planners do not account for the growth pressure necessary to follow a given path, which
+            can cause the robot to burst when it is too high. In this paper, we address the problem
+            of finding minimum-pressure paths for vine robots growing around polytopic obstacles. We
+            propose an efficient algorithm that is guaranteed to find globally optimal solutions in
+            2D and approximate solutions in 3D, with an error that vanishes as a discretization
+            parameter approaches zero.
+          </p>
+          <p>
+            First, we derive a growth pressure equation for vine robots of arbitrary shape, which we
+            use to show that there always exists a minimum-pressure path that is piecewise-linear and
+            can bend only at specific points on the obstacles. We then leverage this observation to
+            reduce the growth-planning problem to a shortest-path problem with time-dependent
+            weights, which we efficiently solve using a modified Dijkstra's algorithm. We demonstrate
+            the speed and scalability of our approach through numerical simulations. We also validate
+            our algorithm with hardware experiments and provide an open-source and high-performance
+            implementation in the Python package VinePlanner.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     Video
+     =================================================================== -->
+<section class="section pt-0">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Video</h2>
+        <div class="video-wrapper">
+          <!-- PLACEHOLDER: swap jNQXAC9IVRw for your video's ID (the part after "watch?v=") -->
+          <iframe src="https://www.youtube.com/embed/jNQXAC9IVRw"
+                  title="Project video"
+                  loading="lazy"
+                  allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  referrerpolicy="strict-origin-when-cross-origin"
+                  allowfullscreen></iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     Interactive demo (placeholder)
+     =================================================================== -->
+<section class="section pt-0">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Try It Yourself</h2>
+        <div id="demo" class="demo-placeholder">
+          <i class="fas fa-route"></i>
+          <p class="is-size-5">Interactive demo coming soon</p>
+          <p>Place obstacles and compare the minimum-pressure and minimum-distance paths.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================
+     BibTeX
+     =================================================================== -->
+<section class="section pt-0" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title">BibTeX</h2>
+    <pre class="bibtex"><code>@article{torres2026efficient,
+  title   = {An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots},
+  author  = {Torres, Andres C. and Marcucci, Tobia and Hawkes, Elliot W.},
+  journal = {arXiv preprint arXiv:2609.18070},
+  year    = {2026}
+}</code></pre>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container has-text-centered">
+    <p class="is-size-7">
+      Website design adapted from
+      <a href="https://nerfies.github.io/" target="_blank" rel="noopener noreferrer">Nerfies</a>,
+      licensed under
+      <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a>.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
