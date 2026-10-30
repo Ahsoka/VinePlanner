@@ -221,7 +221,13 @@ def tikz_preamble() -> str:
 % Styles applied to \addplot must live in the /pgfplots/ key path; those
 % applied to \node and \fill must live in /tikz/. They are therefore split
 % between the two blocks below rather than gathered by subject.
-\usetikzlibrary{{shapes.geometric}}
+\usetikzlibrary{{shapes.geometric, calc}}
+% A dense course draws its obstacles on the basic PGF layer after the axis
+% has closed, which would otherwise paint over the frame and grid. Declaring
+% a layer underneath `main` puts them back where \addplot would have put
+% them. See `course_tikz(dense=...)`.
+\pgfdeclarelayer{{vineobstacles}}
+\pgfsetlayers{{vineobstacles,main}}
 {definitions}
 \pgfplotsset{{
   vine/course axis/.style={{
@@ -245,22 +251,31 @@ def tikz_preamble() -> str:
     legend style={{font=\scriptsize, fill=white, fill opacity=1,
                   text opacity=1, draw=black!60, rounded corners=1pt}},
   }},
+  % Fill only. An outline costs a second path operation per obstacle and,
+  % once a course is dense enough that each obstacle is a point or two
+  % across, the strokes merge into a black mass that hides the fill. The
+  % dense route below draws the same way, so the two agree.
   vine/obstacle/.style={{
-    draw=black, line width=0.5pt,
-    fill=vineobstacle, fill opacity=0.4, draw opacity=0.4,
+    draw=none,
+    fill=vineobstacle, fill opacity=0.4,
   }},
   vine/vertex/.style={{
     only marks, mark=*,
     mark options={{fill=vineobstacle, draw=vineobstacle, scale=0.35}},
   }},
+  % Width, joins and caps shared by all three paths, so one redefinition
+  % restyles them together; the per-path styles carry only colour and dash.
+  vine/path/.style={{
+    line width=1.1pt, line join=round, line cap=round,
+  }},
   vine/distance path/.style={{
-    draw=vinedistance, line width=1.1pt, solid, line join=round, line cap=round,
+    vine/path, draw=vinedistance, solid,
   }},
   vine/angle path/.style={{
-    draw=vineangle, line width=1.1pt, dashed, line join=round, line cap=round,
+    vine/path, draw=vineangle, dashed,
   }},
   vine/pressure path/.style={{
-    draw=vinepressure, line width=1.1pt, dash dot, line join=round, line cap=round,
+    vine/path, draw=vinepressure, dash dot,
   }},
   vine/burst/.style={{
     draw=black, line width=0.9pt, densely dashed,
@@ -268,7 +283,12 @@ def tikz_preamble() -> str:
 }}
 \tikzset{{
   vine/obstacle label/.style={{font=\tiny\bfseries, inner sep=0pt}},
-  vine/start/.style={{fill=vinestart, draw=none}},
+  % Both goal markers are nodes sized by `minimum size`, so either can be
+  % resized by redefining the style alone. The start used to carry its
+  % radius in the emitter, which put it out of reach of a preamble override.
+  vine/start/.style={{
+    circle, minimum size=5.2pt, inner sep=0pt, draw=none, fill=vinestart,
+  }},
   vine/target/.style={{
     star, star points=5, star point ratio=2.3,
     minimum size=7pt, inner sep=0pt, draw=none, fill=vinetarget,
@@ -278,6 +298,7 @@ def tikz_preamble() -> str:
 % to be built by hand. Declaring the node as a plot mark keeps the two from
 % drifting: there is no filled five-pointed mark in pgfplots to approximate
 % it with.
+\pgfdeclareplotmark{{vinestart}}{{\node[vine/start]{{}};}}
 \pgfdeclareplotmark{{vinetarget}}{{\node[vine/target]{{}};}}
 % ---------------------------------------------------------------------"""
 
@@ -312,6 +333,11 @@ def _wrap(body: str, standalone: bool) -> str:
     )
 
 
+#: Node name given to the course axis, so a dense obstacle block emitted
+#: after the axis can anchor its coordinate frame to it.
+_AXIS_NAME = "vinecourseaxis"
+
+
 def _axis(options: list[str], content: list[str]) -> str:
     rendered = "".join(f"    {option},\n" for option in options)
     body = "\n".join(content)
@@ -322,6 +348,79 @@ def _axis(options: list[str], content: list[str]) -> str:
         f"{body}\n"
         "  \\end{axis}\n"
     )
+
+
+#: Obstacle count past which `course_tikz` switches to the basic PGF layer
+#: by default. One `\addplot` per obstacle exhausts TeX's main memory
+#: somewhere between five hundred and two thousand obstacles, so the
+#: threshold sits below the range where the readable form starts to fail.
+_DENSE_OBSTACLE_THRESHOLD = 400
+
+
+def _dense_obstacles(
+    obstacles,
+    width: float,
+    height: float,
+    precision: int,
+) -> list[str]:
+    r"""Obstacle fills as basic-layer PGF, for a course too dense for pgfplots.
+
+    One ``\addplot`` per obstacle makes each obstacle a pgfplots *plot*:
+    coordinate parser, axis transform in TeX's fixed point arithmetic, bounds
+    tracking and plot handler, all per obstacle. That is affordable in the
+    hundreds and fails outright in the thousands, aborting with
+    ``TeX capacity exceeded`` rather than merely running slowly. Dropping to
+    ``\pgfpathmoveto``/``\pgfpathlineto`` and flushing each polygon with
+    ``\pgfusepath`` keeps fifteen thousand obstacles at a second or two,
+    and the output stays pure vector.
+
+    Coordinates are emitted as fractions of the course rather than in data
+    or physical units. The scope takes its unit vectors from the axis
+    corners, so the fractions land correctly whatever the axis is sized to
+    and ``width`` may stay ``\linewidth``. ``\pgfqpointxy`` is the variant
+    that reads those unit vectors without re-parsing units per point.
+
+    The block is clipped to the axis box and sits on a layer beneath
+    ``main``, which together reproduce what being inside the axis gave for
+    free: obstacles cut off at the walls, frame and grid drawn on top.
+    """
+    lines = [
+        "  % obstacles, drawn on the basic PGF layer: see _dense_obstacles",
+        "  \\begin{pgfonlayer}{vineobstacles}",
+        f"  \\begin{{scope}}[shift={{({_AXIS_NAME}.south west)}},",
+        f"    x={{($({_AXIS_NAME}.south east)-({_AXIS_NAME}.south west)$)}},",
+        f"    y={{($({_AXIS_NAME}.north west)-({_AXIS_NAME}.south west)$)}}]",
+        "  \\clip (0,0) rectangle (1,1);",
+        "  \\pgfsetfillcolor{vineobstacle}\\pgfsetfillopacity{0.4}",
+    ]
+
+    for obstacle in obstacles:
+        scaled = obstacle / (width, height)
+
+        pieces = [
+            "  \\pgfpathmoveto{\\pgfqpointxy{"
+            f"{_number(scaled[0, 0], precision)}"
+            "}{"
+            f"{_number(scaled[0, 1], precision)}"
+            "}}"
+        ]
+
+        for point in scaled[1:]:
+            pieces.append(
+                "\\pgfpathlineto{\\pgfqpointxy{"
+                f"{_number(point[0], precision)}"
+                "}{"
+                f"{_number(point[1], precision)}"
+                "}}"
+            )
+
+        pieces.append("\\pgfpathclose\\pgfusepath{fill}")
+        lines.append("".join(pieces))
+
+    lines.append("  \\end{scope}")
+    lines.append("  \\end{pgfonlayer}")
+
+    return lines
 
 
 # --------------------------------------------------------------------- #
@@ -338,6 +437,7 @@ def course_tikz(
     *,
     show_vertices: bool = True,
     show_labels: bool = False,
+    dense: bool = None,
     show_grid: bool = True,
     show_legend: bool = False,
     legend_info=("length", "angle", "pressure"),
@@ -401,6 +501,7 @@ def course_tikz(
     # ---- axis options ------------------------------------------------ #
     options = [
         "vine/course axis",
+        f"name={_AXIS_NAME}",
         f"width={width}",
         f"xmin=0, xmax={_number(course.width, precision)}",
         f"ymin=0, ymax={_number(course.height, precision)}",
@@ -435,19 +536,40 @@ def course_tikz(
         if obstacle is not None and len(np.asarray(obstacle)) >= 3
     ]
 
-    if obstacles:
+    # A course of a few hundred obstacles is comfortable as one \addplot
+    # apiece and stays readable and editable as TeX. Past that the readable
+    # form stops compiling at all, so the obstacles move to the basic PGF
+    # layer; `dense` forces the choice either way.
+    use_dense = (
+        len(obstacles) > _DENSE_OBSTACLE_THRESHOLD if dense is None
+        else bool(dense)
+    )
+
+    if obstacles and not use_dense:
         content.append("    % obstacles")
 
     for obstacle in obstacles:
+        vertices.append(obstacle)
+
+        if use_dense:
+            continue
+
         # Obstacles are convex and stored open, so closing the ring here is
         # all that separates the stored corners from a drawable outline.
         coordinates = np.vstack((obstacle, obstacle[:1]))
-        vertices.append(obstacle)
 
         content.append(
             "    \\addplot[vine/obstacle, forget plot] coordinates "
             f"{{{_coordinates(coordinates, precision, indent='      ')}}};"
         )
+
+    if use_dense:
+        # Corner markers and per-obstacle labels are one pgfplots object (or
+        # one node) each and would reintroduce exactly the cost the dense
+        # route exists to avoid. At this density neither is legible anyway:
+        # an obstacle is a point or two across.
+        show_vertices = False
+        show_labels = False
 
     # ---- vertex markers ---------------------------------------------- #
     # Every polygon corner, which is what plot_polygon(add_points=True) draws.
@@ -464,11 +586,13 @@ def course_tikz(
     if show_labels:
         content.append("    % obstacle labels")
         for index, obstacle in enumerate(obstacles, start=1):
-            point = obstacle.representative_point()
+            # The centroid of a convex polygon lies inside it, so it is a
+            # safe anchor for the label.
+            point = obstacle.mean(axis=0)
             content.append(
                 "    \\node[vine/obstacle label] at "
-                f"(axis cs:{_number(point.x, precision)},"
-                f"{_number(point.y, precision)}) {{{index}}};"
+                f"(axis cs:{_number(point[0], precision)},"
+                f"{_number(point[1], precision)}) {{{index}}};"
             )
 
     # ---- goals ------------------------------------------------------- #
@@ -484,7 +608,7 @@ def course_tikz(
     for name, point, style, legend_name, image in (
         (
             "vinestartpoint", start, "vine/start", "start",
-            "only marks, mark=*, mark options={fill=vinestart, draw=none}",
+            "only marks, mark=vinestart",
         ),
         (
             "vinetargetpoint", end, "vine/target", "target",
@@ -505,7 +629,7 @@ def course_tikz(
             content.append(f"    \\addlegendentry{{{_escape(legend_name)}}}")
 
         if style == "vine/start":
-            trailer.append(f"  \\fill[{style}] ({name}) circle[radius=2.6pt];")
+            trailer.append(f"  \\node[{style}] at ({name}) {{}};")
         else:
             trailer.append(f"  \\node[{style}] at ({name}) {{}};")
 
@@ -551,6 +675,14 @@ def course_tikz(
                 pressure_units=pressure_label,
             )
             content.append(f"    \\addlegendentry{{{_escape(entry)}}}")
+
+    if use_dense and obstacles:
+        trailer[:0] = _dense_obstacles(
+            obstacles,
+            course.width,
+            course.height,
+            precision,
+        )
 
     body = _style_block(styles) + _axis(options, content)
 
