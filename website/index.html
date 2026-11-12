@@ -70,20 +70,108 @@
       border: 0;
     }
 
-    .demo-placeholder {
-      border: 2px dashed #b5b5b5;
-      border-radius: 8px;
-      min-height: 420px;
+    /* ---- Interactive demo ---- */
+    #demo [hidden] { display: none !important; }
+
+    .demo-loading {
+      min-height: 320px;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
+      gap: 1rem;
       color: #7a7a7a;
       background: #fafafa;
-      text-align: center;
-      padding: 2rem;
+      border-radius: 8px;
     }
-    .demo-placeholder i { font-size: 2.5rem; margin-bottom: 1rem; }
+    .demo-spinner {
+      width: 36px;
+      height: 36px;
+      border: 4px solid #dbdbdb;
+      border-top-color: #2a9d3f;
+      border-radius: 50%;
+      animation: demo-spin 0.9s linear infinite;
+    }
+    .demo-loading.failed .demo-spinner { display: none; }
+    @keyframes demo-spin { to { transform: rotate(360deg); } }
+
+    .demo-toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem; }
+
+    #demo-course {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fafafa;
+      border: 1px solid #dbdbdb;
+      border-radius: 8px;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .demo-obstacle { fill: #4a4a4a; cursor: grab; }
+    .demo-obstacle.selected { fill: #3273dc; }
+    .demo-handle { fill: #fff; stroke: #3273dc; stroke-width: 2; cursor: pointer; }
+    .demo-path {
+      fill: none;
+      stroke-width: 5;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+      pointer-events: none;
+    }
+    .demo-path.pressure { stroke: #2a9d3f; }
+    .demo-path.distance { stroke: #e0443e; stroke-width: 4; stroke-dasharray: 10 8; }
+    .demo-path.stale { opacity: 0.25; }
+    .demo-start { fill: #363636; cursor: grab; }
+    .demo-goal { fill: #fafafa; stroke: #363636; stroke-width: 4; cursor: grab; }
+    .demo-label {
+      font-size: 15px;
+      fill: #4a4a4a;
+      text-anchor: middle;
+      paint-order: stroke;
+      stroke: #fafafa;
+      stroke-width: 5px;
+      stroke-linejoin: round;
+      pointer-events: none;
+    }
+    .demo-label.pressure { fill: #1f7a30; }
+    .demo-label.distance { fill: #b5322d; }
+    .demo-preview { fill: rgba(50, 115, 220, 0.2); stroke: #3273dc; stroke-width: 2; stroke-dasharray: 6 5; }
+    .demo-preview-dot { fill: #3273dc; }
+
+    .demo-message { margin: 0.75rem 0; min-height: 1.5em; color: #4a4a4a; }
+
+    .demo-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+      text-align: left;
+    }
+    .demo-card { background: #f5f5f5; border-radius: 8px; padding: 0.9rem 1rem; }
+    .demo-card-title { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; color: #4a4a4a; }
+    .demo-card-value { font-family: 'Google Sans', sans-serif; font-size: 1.6rem; font-weight: 500; }
+    .demo-card-detail { font-size: 0.9rem; color: #4a4a4a; }
+    .demo-swatch { display: inline-block; width: 26px; height: 0; border-top: 4px solid #2a9d3f; }
+    .demo-swatch.distance { border-top: 4px dashed #e0443e; }
+
+    #demo-plot { display: block; width: 100%; height: auto; }
+    .demo-plot-grid { stroke: #ededed; stroke-width: 1; }
+    .demo-plot-axis { stroke: #b5b5b5; stroke-width: 1; }
+    .demo-plot-burst { stroke: #7a7a7a; stroke-width: 1; stroke-dasharray: 5 5; }
+    .demo-plot-text { font-size: 13px; fill: #7a7a7a; }
+    .demo-curve { fill: none; stroke-width: 3; stroke-linejoin: round; }
+    .demo-curve.pressure { stroke: #2a9d3f; }
+    .demo-curve.distance { stroke: #e0443e; stroke-dasharray: 8 6; }
+
+    .demo-sliders {
+      display: grid;
+      grid-template-columns: max-content 1fr 4em;
+      gap: 0.4rem 0.9rem;
+      align-items: center;
+      text-align: left;
+      margin: 0.75rem 0;
+    }
+    .demo-sliders input { width: 100%; }
 
     pre.bibtex {
       background: #f5f5f5;
@@ -237,18 +325,69 @@
 </section>
 
 <!-- ===================================================================
-     Interactive demo (placeholder)
+     Interactive demo
      =================================================================== -->
 <section class="section pt-0">
   <div class="container is-max-desktop">
     <div class="columns is-centered has-text-centered">
       <div class="column is-four-fifths">
         <h2 class="title is-3">Try It Yourself</h2>
-        <div id="demo" class="demo-placeholder">
-          <i class="fas fa-route"></i>
-          <p class="is-size-5">Interactive demo coming soon</p>
-          <p>Place obstacles and compare the minimum-pressure and minimum-distance paths.</p>
+
+        <div id="demo">
+          <div id="demo-loading" class="demo-loading">
+            <div class="demo-spinner" aria-hidden="true"></div>
+            <p id="demo-status" role="status">Loading interactive demo…</p>
+          </div>
+
+          <div id="demo-app" hidden>
+            <div class="demo-toolbar">
+              <button class="button is-small is-rounded" id="demo-add">Add rectangle</button>
+              <button class="button is-small is-rounded" id="demo-draw">Draw polygon</button>
+              <button class="button is-small is-rounded" id="demo-delete" disabled>Delete selected</button>
+              <button class="button is-small is-rounded" id="demo-reset">Reset course</button>
+            </div>
+
+            <svg id="demo-course" viewBox="0 0 800 336" role="img"
+                 aria-label="Obstacle course with the minimum-pressure and minimum-distance paths"></svg>
+            <p id="demo-message" class="demo-message" role="status"></p>
+
+            <div class="demo-cards">
+              <div class="demo-card">
+                <div class="demo-card-title"><span class="demo-swatch"></span>Minimum pressure</div>
+                <div class="demo-card-value" id="demo-pressure-value"></div>
+                <div class="demo-card-detail" id="demo-pressure-detail"></div>
+              </div>
+              <div class="demo-card">
+                <div class="demo-card-title"><span class="demo-swatch distance"></span>Minimum distance</div>
+                <div class="demo-card-value" id="demo-distance-value"></div>
+                <div class="demo-card-detail" id="demo-distance-detail"></div>
+              </div>
+            </div>
+
+            <svg id="demo-plot" viewBox="0 0 800 230" role="img"
+                 aria-label="Growth pressure against deployed length for both paths"></svg>
+
+            <div class="demo-sliders">
+              <label for="demo-mu">Bend friction μ</label>
+              <input type="range" id="demo-mu" min="0" max="1" step="0.005" value="0.315">
+              <output id="demo-mu-out"></output>
+
+              <label for="demo-tension">Tail tension T/A (kPa)</label>
+              <input type="range" id="demo-tension" min="0" max="20" step="0.001" value="5.426">
+              <output id="demo-tension-out"></output>
+
+              <label for="demo-friction">Length friction λ/A (kPa/m)</label>
+              <input type="range" id="demo-friction" min="0" max="3" step="0.001" value="0.771">
+              <output id="demo-friction-out"></output>
+
+              <label for="demo-yield">Yield pressure Y (kPa)</label>
+              <input type="range" id="demo-yield" min="0" max="10" step="0.001" value="1.917">
+              <output id="demo-yield-out"></output>
+            </div>
+            <button class="button is-small is-rounded" id="demo-paper">Paper values</button>
+          </div>
         </div>
+
       </div>
     </div>
   </div>
@@ -279,6 +418,35 @@
     </p>
   </div>
 </footer>
+
+<script type="module">
+  // Starts Python only after the rest of the page has finished loading.
+  const PYODIDE = "https://cdn.jsdelivr.net/pyodide/v0.29.3/full/";
+
+  async function startDemo() {
+    try {
+      const { loadPyodide } = await import(PYODIDE + "pyodide.mjs");
+      const pyodide = await loadPyodide({ indexURL: PYODIDE });
+      await pyodide.loadPackage("numpy");
+
+      for (const file of ["planner.py", "demo.py"]) {
+        const response = await fetch(file);
+        if (!response.ok) throw new Error("Could not load " + file);
+        pyodide.FS.writeFile(file, await response.text());
+      }
+
+      pyodide.runPython("import sys; sys.path.insert(0, '.'); import demo");
+    } catch (error) {
+      console.error(error);
+      document.getElementById("demo-loading").classList.add("failed");
+      document.getElementById("demo-status").textContent =
+        "The demo couldn't load. Reload the page to try again.";
+    }
+  }
+
+  if (document.readyState === "complete") startDemo();
+  else window.addEventListener("load", startDemo);
+</script>
 
 </body>
 </html>
