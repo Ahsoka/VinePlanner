@@ -626,7 +626,7 @@ class VisibilityMixin:
             float(tol),
         )
 
-    def visible_pairs(self, points, chunk: int = 4_000_000, tol: float = 1e-9):
+    def visible_pairs(self, points, chunk: int = 256 * 1024 * 1024, tol: float = 1e-9):
         """Index arrays ``(i, j)``, ``i < j``, of every mutually visible pair.
 
         The pair count grows as ``n**2``, so the upper triangle is walked a
