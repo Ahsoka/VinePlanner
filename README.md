@@ -138,12 +138,11 @@ Only $\mu$ and the ratio $T/\lambda$ affect which path is optimal. $Y$ and $A$ s
 ## Citation
 
 ```bibtex
-@misc{torres2026vineplanner,
-  title         = {An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots},
-  author        = {Torres, Andres C. and Marcucci, Tobia and Hawkes, Elliot W.},
-  year          = {2026},
-  eprint        = {2609.18070},
-  archivePrefix = {arXiv}
+@article{torres2026efficient,
+  title   = {An Efficient Algorithm for Minimum-Pressure Growth Planning of Vine Robots},
+  author  = {Torres, Andres C. and Marcucci, Tobia and Hawkes, Elliot W.},
+  journal = {arXiv preprint arXiv:2609.18070},
+  year    = {2026}
 }
 ```
 
