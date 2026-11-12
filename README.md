@@ -26,7 +26,7 @@ every turn they make. If that pressure exceeds the burst pressure, the robot rup
 of convex polytopic obstacles:
 
 - **Globally optimal in 2D**, and optimal up to a discretization parameter in 3D
-- **Fast:** hundreds of obstacles in tens of milliseconds; 15,000 obstacles in about 21 s
+- **Fast:** hundreds of obstacles in tens of milliseconds; 15,000 obstacles in about 30 s
 - **Hardware-validated:** the pressure model ranked paths correctly in 100% of trials in both 2D and 3D obstacle courses
 
 > **Why not just take the shortest path?** On a 15,000-obstacle course, the minimum-distance
@@ -96,6 +96,19 @@ A few things to know:
 - **Random courses:** `ObstacleCourse.random(...)` generates random 2D courses, and `ObstacleCourseVoxels` handles 3D voxel courses.
 - **First-run slowness:** the first call is slower while Numba compiles its kernels.
 
+## Reproducing the paper's figures
+
+Each figure has its own notebook in [`figures/`](figures). They run straight from a clone of the repo; installing the package is optional.
+
+| Notebook | Figure | Runtime |
+|---|---|---|
+| [`fig1_2d_course.ipynb`](figures/fig1_2d_course.ipynb) | Fig. 1: 2D hardware obstacle course | ~1 min |
+| [`fig3_runtime_scaling.ipynb`](figures/fig3_runtime_scaling.ipynb) | Fig. 3: runtime scaling | seconds (paper's data); optional rerun takes minutes to hours |
+| [`fig4_dense_course.ipynb`](figures/fig4_dense_course.ipynb) | Fig. 4: 15,000-obstacle course | ~3 min |
+| [`fig5_3d_course.ipynb`](figures/fig5_3d_course.ipynb) | Fig. 5: 3D hardware obstacle course | <1 min |
+
+Figure 3 plots the timings from the paper's original run, stored in `figures/data/fig3_scaling_results.csv`. To time the planner on your own machine, set `RUN_BENCHMARK = True` in that notebook. Absolute times depend on your hardware; the paper's results were measured on an 8-core AMD Ryzen 7 7800X3D.
+
 ## Repository layout
 
 ```
@@ -105,6 +118,7 @@ vine_planner/
   constants.py         # fitted pressure-model constants and unit tables
   utils.py             # pressure evaluation and geometry helpers
   tikz.py              # TikZ/pgfplots export used for the paper figures
+figures/               # notebooks that reproduce the paper's figures
 website/               # project website and the in-browser (Pyodide) demo
 ```
 
