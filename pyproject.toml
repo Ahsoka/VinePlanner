@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vine_planner"
+version = "1.0.0"
+description = "Globally optimal minimum-pressure growth planning for vine robots"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Andres C. Torres" },
+  { name = "Tobia Marcucci" },
+  { name = "Elliot W. Hawkes" },
+]
+dependencies = ["numpy", "scipy>=1.14", "numba", "attrs", "matplotlib"]
+
+[project.optional-dependencies]
+3d = ["pyvista"]
+
+[project.urls]
+Homepage = "https://ahsoka.github.io/VinePlanner/"
+Paper = "https://arxiv.org/abs/2609.18070"
+Source = "https://github.com/Ahsoka/VinePlanner"
+
+[tool.setuptools]
+packages = ["vine_planner"]
